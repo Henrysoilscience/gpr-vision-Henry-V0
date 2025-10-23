@@ -1,0 +1,7 @@
+root: data/processed
+train_split: data/splits/train.txt
+val_split: data/splits/val.txt
+test_split: data/splits/test.txt
+classes:
+  - background
+  - target
