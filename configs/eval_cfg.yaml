@@ -1,0 +1,7 @@
+threshold: 0.5
+summary_path: eval_summary.json
+metrics:
+  - precision
+  - recall
+  - iou
+report_samples: 10
