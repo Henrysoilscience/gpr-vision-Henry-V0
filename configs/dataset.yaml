@@ -1,3 +1,11 @@
+paths:
+  raw_data_root: data/raw
+  processed_data_root: data/processed
+  label_root: data/labels
+  split_files_root: data/splits
+  model_cache_dir: models/cache
+  weights_output_dir: models
+  evaluation_output_dir: outputs/eval
 root: data/processed
 train_split: data/splits/train.txt
 val_split: data/splits/val.txt

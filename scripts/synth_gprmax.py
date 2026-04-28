@@ -9,9 +9,12 @@ from typing import Dict, List
 
 import numpy as np
 
+from config_layer import add_path_override_args, load_runtime_config
+from config_layer import validate_paths
 
 def parse_args() -> argparse.Namespace:
     """Build CLI arguments for synthetic scene generation."""
+    runtime = load_runtime_config()
     parser = argparse.ArgumentParser(
         description=(
             "Create synthetic radar scenes using random material mixes."
@@ -20,11 +23,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "output_root",
         type=pathlib.Path,
+        nargs="?",
+        default=runtime.paths["processed_data_root"],
         help=(
             "Directory receiving synthetic scenes; reducing it shortens "
             "stored history depth."
         ),
     )
+    add_path_override_args(parser, runtime.paths)
     parser.add_argument(
         "--count",
         type=int,
@@ -140,6 +146,10 @@ def save_scene(
 def main() -> None:
     """Entry point for generating synthetic data."""
     args = parse_args()
+    validate_paths(
+        required_existing=[],
+        create_if_missing=[args.output_root],
+    )
     rng = np.random.default_rng(args.seed)
     manifests: List[Dict[str, str]] = []
     for index in range(args.count):

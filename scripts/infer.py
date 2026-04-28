@@ -10,6 +10,8 @@ from typing import Iterable, List
 import numpy as np
 import torch
 
+from config_layer import add_path_override_args, load_runtime_config
+from config_layer import validate_paths
 
 class SimpleUNet(torch.nn.Module):
     """Simplified UNet decoder for binary segmentation."""
@@ -84,6 +86,8 @@ class SimpleClassifier(torch.nn.Module):
 
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for inference."""
+    runtime = load_runtime_config()
+    train_cfg = runtime.raw
     parser = argparse.ArgumentParser(
         description=(
             "Generate predictions from trained checkpoints."
@@ -92,6 +96,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "input_path",
         type=pathlib.Path,
+        nargs="?",
+        default=runtime.paths["processed_data_root"],
         help=(
             "File or directory holding .npy radargrams; fewer samples "
             "shorten processing."
@@ -100,6 +106,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "output_dir",
         type=pathlib.Path,
+        nargs="?",
+        default=runtime.paths["evaluation_output_dir"],
         help=(
             "Directory to store predictions; limited space prunes "
             "history."
@@ -117,7 +125,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-type",
         choices=["segmentation", "classification"],
-        default="segmentation",
+        default=train_cfg.get("model_type", "segmentation"),
         help=(
             "Model family for inference; classification outputs class "
             "probabilities."
@@ -132,6 +140,7 @@ def parse_args() -> argparse.Namespace:
             "values reduce false alarms."
         ),
     )
+    add_path_override_args(parser, runtime.paths)
     return parser.parse_args()
 
 
@@ -199,6 +208,22 @@ def save_output(
 def main() -> None:
     """Execute inference pipeline."""
     args = parse_args()
+    validate_paths(
+        required_existing=[
+            args.input_path,
+            args.checkpoint,
+            args.raw_data_root,
+            args.processed_data_root,
+            args.label_root,
+            args.split_files_root,
+        ],
+        create_if_missing=[
+            args.output_dir,
+            args.weights_output_dir,
+            args.evaluation_output_dir,
+            args.model_cache_dir,
+        ],
+    )
     model = load_model(args)
     outputs: List[str] = []
     for input_file in iter_inputs(args.input_path):

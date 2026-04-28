@@ -1,3 +1,4 @@
+paths: {}
 model_type: segmentation
 epochs: 5
 batch_size: 4

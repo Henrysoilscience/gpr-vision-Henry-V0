@@ -1,3 +1,4 @@
+paths: {}
 threshold: 0.5
 summary_path: eval_summary.json
 metrics:

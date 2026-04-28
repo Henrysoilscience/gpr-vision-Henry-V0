@@ -10,9 +10,12 @@ from typing import Iterable, List
 import numpy as np
 from PIL import Image
 
+from config_layer import add_path_override_args, load_runtime_config
+from config_layer import validate_paths
 
 def parse_args() -> argparse.Namespace:
     """Build the CLI parser and capture arguments."""
+    runtime = load_runtime_config()
     parser = argparse.ArgumentParser(
         description=(
             "Convert DZT radargrams into normalized PNG and NPY pairs."
@@ -21,6 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "input_root",
         type=pathlib.Path,
+        nargs="?",
+        default=runtime.paths["raw_data_root"],
         help=(
             "Root directory containing source .DZT files; fewer files "
             "reduce diversity across samples."
@@ -29,11 +34,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "output_root",
         type=pathlib.Path,
+        nargs="?",
+        default=runtime.paths["processed_data_root"],
         help=(
             "Directory storing processed outputs; limited space lowers "
             "history retention."
         ),
     )
+    add_path_override_args(parser, runtime.paths)
     parser.add_argument(
         "--gain",
         type=float,
@@ -138,6 +146,10 @@ def write_manifest(
 def main() -> None:
     """Run the preprocessing pipeline."""
     args = parse_args()
+    validate_paths(
+        required_existing=[args.input_root],
+        create_if_missing=[args.output_root],
+    )
     entries: List[dict] = []
     for source in iter_sources(args.input_root):
         radargram = read_dzt(source)

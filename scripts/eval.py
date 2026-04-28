@@ -9,9 +9,13 @@ from typing import Dict, List
 
 import numpy as np
 
+from config_layer import add_path_override_args, load_runtime_config
+from config_layer import validate_paths
 
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for evaluation."""
+    runtime = load_runtime_config()
+    eval_cfg = runtime.raw
     parser = argparse.ArgumentParser(
         description=(
             "Compute IoU, precision, and recall statistics."
@@ -20,6 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "ground_truth",
         type=pathlib.Path,
+        nargs="?",
+        default=runtime.paths["processed_data_root"],
         help=(
             "Directory holding ground truth masks; missing files lower "
             "metric trust."
@@ -28,6 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "predictions",
         type=pathlib.Path,
+        nargs="?",
+        default=runtime.paths["evaluation_output_dir"],
         help=(
             "Directory holding predicted masks; noisier outputs reduce "
             "scores."
@@ -36,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.5,
+        default=eval_cfg.get("threshold", 0.5),
         help=(
             "Probability threshold for binarizing predictions; higher "
             "values reduce false positives but may miss weak signals."
@@ -45,12 +53,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--summary",
         type=pathlib.Path,
-        default=pathlib.Path("eval_summary.json"),
+        default=pathlib.Path(eval_cfg.get("summary_path", "eval_summary.json")),
         help=(
             "Path to save summary JSON; skipping updates impairs "
             "reproducibility."
         ),
     )
+    add_path_override_args(parser, runtime.paths)
     return parser.parse_args()
 
 
@@ -143,6 +152,22 @@ def save_summary(summary: Dict[str, float], path: pathlib.Path) -> None:
 def main() -> None:
     """Run evaluation over the dataset."""
     args = parse_args()
+    validate_paths(
+        required_existing=[
+            args.ground_truth,
+            args.predictions,
+            args.raw_data_root,
+            args.processed_data_root,
+            args.label_root,
+            args.split_files_root,
+        ],
+        create_if_missing=[
+            args.summary.parent,
+            args.weights_output_dir,
+            args.evaluation_output_dir,
+            args.model_cache_dir,
+        ],
+    )
     pairs = collect_pairs(args.ground_truth, args.predictions)
     metrics: List[Dict[str, float]] = []
     for pair in pairs:

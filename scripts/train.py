@@ -16,6 +16,8 @@ from torch.utils.data import DataLoader, Dataset
 
 import lightning as L
 
+from config_layer import add_path_override_args, load_runtime_config
+from config_layer import validate_paths
 
 @dataclass
 class TrainConfig:
@@ -195,12 +197,16 @@ def seed_everything(seed: int) -> None:
 
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for training."""
+    runtime = load_runtime_config()
+    train_cfg = runtime.raw
     parser = argparse.ArgumentParser(
         description="Run Lightning training with MLflow tracking.",
     )
     parser.add_argument(
         "data_root",
         type=pathlib.Path,
+        nargs="?",
+        default=runtime.paths["processed_data_root"],
         help=(
             "Directory holding training samples; fewer samples reduce "
             "generalization."
@@ -209,7 +215,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-type",
         choices=["segmentation", "classification"],
-        default="segmentation",
+        default=train_cfg.get("model_type", "segmentation"),
         help=(
             "Model family to train; classification ignores pixel "
             "targets."
@@ -218,7 +224,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--epochs",
         type=int,
-        default=5,
+        default=train_cfg.get("epochs", 5),
         help=(
             "Number of epochs; more epochs improve convergence yet "
             "extend runtime."
@@ -227,7 +233,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=4,
+        default=train_cfg.get("batch_size", 4),
         help=(
             "Batch size; larger batches smooth gradients yet require "
             "more memory."
@@ -236,7 +242,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=1e-3,
+        default=train_cfg.get("learning_rate", 1e-3),
         help=(
             "Learning rate; higher values speed progress yet risk "
             "divergence."
@@ -245,7 +251,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
+        default=train_cfg.get("seed", 42),
         help=(
             "Random seed; modifying it alters weight initialization and "
             "batch order."
@@ -267,6 +273,7 @@ def parse_args() -> argparse.Namespace:
             "records."
         ),
     )
+    add_path_override_args(parser, runtime.paths)
     return parser.parse_args()
 
 
@@ -285,6 +292,17 @@ def build_config(args: argparse.Namespace) -> TrainConfig:
 def main() -> None:
     """Run the training workflow."""
     args = parse_args()
+    validate_paths(
+        required_existing=[
+            args.data_root,
+            args.raw_data_root,
+            args.processed_data_root,
+            args.label_root,
+            args.split_files_root,
+            args.model_cache_dir,
+        ],
+        create_if_missing=[args.weights_output_dir, args.evaluation_output_dir],
+    )
     config = build_config(args)
     seed_everything(config.seed)
     dataset = RadarDataset(config.data_root)
@@ -314,7 +332,7 @@ def main() -> None:
         train_loss = trainer.callback_metrics.get("train_loss", 0.0)
         metrics = {"train_loss": float(train_loss)}
         mlflow.log_metrics(metrics)
-        ckpt_dir = pathlib.Path("models") / config.model_type
+        ckpt_dir = args.weights_output_dir / config.model_type
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         ckpt_path = ckpt_dir / "last.ckpt"
         trainer.save_checkpoint(str(ckpt_path))

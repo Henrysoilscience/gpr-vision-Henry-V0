@@ -44,25 +44,48 @@ gpr-vision/
    pip install -r requirements.txt
    ```
 
+## Config Loading and Path Precedence
+All script entrypoints load these files at startup:
+
+- `configs/dataset.yaml`
+- `configs/train_cfg.yaml`
+- `configs/eval_cfg.yaml`
+
+Standard path keys live under `paths`:
+
+- `raw_data_root`
+- `processed_data_root`
+- `label_root`
+- `split_files_root`
+- `model_cache_dir`
+- `weights_output_dir`
+- `evaluation_output_dir`
+
+Path resolution order is: **CLI overrides > config values > built-in
+defaults**.
+
+Every script validates required input paths and fails fast when missing.
+Output directories are auto-created when safe.
+
 ## Data Preparation
 1. Place `.DZT` files under `data/raw`.
 2. Run preprocessing:
    ```bash
-   python scripts/prep_readgssi.py data/raw data/processed \
-       --normalize --manifest docs/prep_manifest.json
+   python scripts/prep_readgssi.py --normalize \
+       --manifest docs/prep_manifest.json
    ```
 3. Review generated manifests and PNG previews for quality control.
 
 ## Synthetic Data Generation
 ```bash
-python scripts/synth_gprmax.py data/processed --count 20 --seed 7
+python scripts/synth_gprmax.py --count 20 --seed 7
 ```
 Tune the `--count`, `--width`, `--height`, and `--anomalies` arguments to
 control variety, resolution, and target density.
 
 ## Training
 ```bash
-python scripts/train.py data/processed --model-type segmentation \
+python scripts/train.py --model-type segmentation \
     --epochs 10 --batch-size 8 --learning-rate 0.0005 \
     --mlflow-run-name phase-a-baseline
 ```
@@ -71,14 +94,14 @@ MLflow using the configured tracking URI.
 
 ## Evaluation
 ```bash
-python scripts/eval.py data/processed data/processed --threshold 0.5 \
+python scripts/eval.py --threshold 0.5 \
     --summary docs/eval_summary.json
 ```
 Adjust the threshold to balance precision and recall for downstream use.
 
 ## Inference
 ```bash
-python scripts/infer.py data/processed models/outputs \
+python scripts/infer.py data/processed outputs/eval \
     --checkpoint models/segmentation/last.ckpt --model-type segmentation
 ```
 Generated logits, masks, or probabilities are stored inside the specified
