@@ -106,12 +106,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--model-dir",
+        type=pathlib.Path,
+        default=pathlib.Path("models"),
+        help=(
+            "Directory containing pretrained and fine-tuned weights; "
+            "relative checkpoints resolve from here."
+        ),
+    )
+    parser.add_argument(
         "--checkpoint",
         type=pathlib.Path,
-        required=True,
+        default=pathlib.Path("last.ckpt"),
         help=(
-            "Model checkpoint to load; outdated checkpoints reduce "
-            "accuracy."
+            "Checkpoint filename/path; relative values resolve to "
+            "--model-dir/<model-type>/."
         ),
     )
     parser.add_argument(
@@ -141,7 +150,29 @@ def load_model(args: argparse.Namespace) -> torch.nn.Module:
         model = SimpleUNet()
     else:
         model = SimpleClassifier()
-    state = torch.load(args.checkpoint, map_location="cpu")
+    model_dir = args.model_dir.resolve()
+    checkpoint_path = args.checkpoint
+    if checkpoint_path.is_absolute():
+        resolved_checkpoint = checkpoint_path.resolve()
+    else:
+        resolved_checkpoint = (model_dir / args.model_type / checkpoint_path).resolve()
+    if not resolved_checkpoint.exists():
+        expected_patterns = [
+            model_dir / args.model_type / "last.ckpt",
+            model_dir / args.model_type / "best.ckpt",
+            model_dir / args.model_type / "*.ckpt",
+        ]
+        expected_text = "\n".join(
+            f"  - {pattern}" for pattern in expected_patterns
+        )
+        message = (
+            f"Checkpoint file not found: {resolved_checkpoint}\n"
+            "Expected filenames/patterns include:\n"
+            f"{expected_text}\n"
+            "Set --model-dir and --checkpoint to valid locations."
+        )
+        raise FileNotFoundError(message)
+    state = torch.load(resolved_checkpoint, map_location="cpu")
     if isinstance(state, dict) and "state_dict" in state:
         # Lightning checkpoints keep weights under state_dict.
         model.load_state_dict({k.replace("net.", "", 1): v
@@ -214,7 +245,24 @@ def main() -> None:
         )
         outputs.append(str(result_dir))
     summary_path = args.output_dir / "infer_summary.json"
-    summary_path.write_text(json.dumps(outputs, indent=2))
+    summary = {
+        "outputs": outputs,
+        "resolved_model_dir": str(args.model_dir.resolve()),
+        "resolved_checkpoint": str(
+            args.checkpoint.resolve()
+            if args.checkpoint.is_absolute()
+            else (
+                args.model_dir.resolve()
+                / args.model_type
+                / args.checkpoint
+            ).resolve()
+        ),
+        "input_path": str(args.input_path.resolve()),
+        "output_dir": str(args.output_dir.resolve()),
+        "model_type": args.model_type,
+        "threshold": args.threshold,
+    }
+    summary_path.write_text(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":
