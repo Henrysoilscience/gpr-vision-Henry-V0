@@ -22,6 +22,8 @@ from torch.utils.data import DataLoader, Dataset
 class TrainScriptError(Exception):
     """Raised when the training CLI receives invalid inputs."""
 
+from config_layer import add_path_override_args, load_runtime_config
+from config_layer import validate_paths
 
 @dataclass
 class TrainConfig:
@@ -336,6 +338,17 @@ def build_config(args: argparse.Namespace) -> TrainConfig:
 
 def run() -> None:
     args = parse_args()
+    validate_paths(
+        required_existing=[
+            args.data_root,
+            args.raw_data_root,
+            args.processed_data_root,
+            args.label_root,
+            args.split_files_root,
+            args.model_cache_dir,
+        ],
+        create_if_missing=[args.weights_output_dir, args.evaluation_output_dir],
+    )
     config = build_config(args)
     validate_config(config)
     seed_everything(config.seed)
