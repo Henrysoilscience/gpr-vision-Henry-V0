@@ -266,6 +266,29 @@ python scripts/eval.py data/processed outputs/inference --threshold 0.5 \
   --summary outputs/evaluation/eval_summary.json
 ```
 
+### Inference parameter guide
+| Parameter | Valid range | Increase effect | Decrease effect |
+| --- | --- | --- | --- |
+| `--threshold` (segmentation) | `0.0` to `1.0` | Fewer false alarms, higher precision, lower recall | More positives recovered, higher recall, lower precision |
+
+## Config schema quick reference
+
+### `configs/train_cfg.yaml`
+| Field | Valid range | Increase effect | Decrease effect |
+| --- | --- | --- | --- |
+| `epochs` | `1` to `500` | Better convergence potential, more overfit/runtime risk | Faster runs, higher underfit risk |
+| `batch_size` | `1` to `256` (memory-limited) | Better throughput, higher memory, possible generalization drop | Lower memory, slower/noisier training |
+| `learning_rate` | `1e-6` to `1e-1` | Faster progress, less stable | Slower progress, more stable |
+| `augmentations.noise_std` | `0.0` to `1.0` | Better noise robustness, possible underfit | Less robustness to noisy inputs |
+| `augmentations.rotate_degrees` | `0` to `30` | More rotation invariance, more artifacts/time | Less invariance, cleaner transforms |
+| `augmentations.contrast_limit` | `0.0` to `1.0` | More intensity robustness, bigger domain shift risk | Less robustness, closer to original contrast |
+
+### `configs/eval_cfg.yaml`
+| Field | Valid range | Increase effect | Decrease effect |
+| --- | --- | --- | --- |
+| `threshold` | `0.0` to `1.0` | Higher precision tendency, lower recall tendency | Higher recall tendency, lower precision tendency |
+| `report_samples` | `1` to `1000` (dataset-limited) | More representative report, slower analysis | Faster analysis, noisier sample estimate |
+
 ## Documentation
 - `docs/labels_manual.md`: Annotation criteria and negative examples.
 - `docs/experiment_log.md`: Key experiment metadata and results.
