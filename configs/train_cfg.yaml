@@ -1,10 +1,41 @@
-paths: {}
+# Training config schema
+# model_type: segmentation | classification.
+#   Picks task head. Segmentation optimizes pixel-level masks (better
+#   localization, higher compute). Classification is faster/lighter but
+#   returns image-level labels only.
 model_type: segmentation
+# epochs: int in [1, 500].
+#   Increase for better convergence/recall until overfitting appears.
+#   Decrease for faster experiments and lower overfitting risk.
 epochs: 5
+# batch_size: int in [1, 256], memory-limited.
+#   Increase for higher throughput and smoother gradients, at the cost
+#   of more memory and potential generalization drop.
+#   Decrease for lower memory and sometimes better generalization, but
+#   with noisier gradients and slower wall-clock progress.
 batch_size: 4
+# learning_rate: float in [1e-6, 1e-1] for Adam.
+#   Increase for faster early learning but higher instability/divergence
+#   risk. Decrease for stabler optimization and often better final
+#   minima, but with slower convergence.
 learning_rate: 0.001
+# seed: non-negative int (commonly [0, 2**31 - 1]).
+#   Change to measure run-to-run variance; keep fixed for reproducible
+#   comparisons.
 seed: 42
 augmentations:
+  # noise_std: float in [0.0, 1.0].
+  #   Increase to improve robustness to sensor noise, with risk of
+  #   underfitting clean data and slower convergence.
+  #   Decrease to preserve clean patterns, with lower robustness.
   noise_std: 0.3
+  # rotate_degrees: float in [0, 30] for this dataset family.
+  #   Increase to improve orientation invariance, at the cost of
+  #   interpolation artifacts and longer preprocessing time.
+  #   Decrease to keep geometry crisp but reduce invariance.
   rotate_degrees: 10
+  # contrast_limit: float in [0.0, 1.0].
+  #   Increase to broaden intensity variation robustness, but can shift
+  #   samples away from deployment distribution.
+  #   Decrease to stay closer to source contrast statistics.
   contrast_limit: 0.2

@@ -1,8 +1,21 @@
-paths: {}
+# Evaluation config schema
+# threshold: float in [0.0, 1.0].
+#   Increase to reduce false positives and typically raise precision,
+#   while potentially lowering recall.
+#   Decrease to recover weaker positives and typically raise recall,
+#   while potentially lowering precision.
 threshold: 0.5
+# summary_path: output JSON file path.
+#   Keep a stable path for longitudinal comparisons across runs.
 summary_path: eval_summary.json
+# metrics: list containing any of [precision, recall, iou].
+#   Precision favors fewer false alarms, recall favors fewer misses,
+#   and IoU summarizes overlap quality for segmentation.
 metrics:
   - precision
   - recall
   - iou
+# report_samples: int in [1, 1000], bounded by dataset size.
+#   Increase for more representative qualitative slices (slower reports).
+#   Decrease for faster reports (higher sampling noise).
 report_samples: 10

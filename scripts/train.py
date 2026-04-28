@@ -3,25 +3,51 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pathlib
-from dataclasses import dataclass
-from typing import List, Tuple
+import sys
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Tuple
 
+import lightning as L
 import mlflow
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-import lightning as L
+
+class TrainScriptError(Exception):
+    """Raised when the training CLI receives invalid inputs."""
 
 from config_layer import add_path_override_args, load_runtime_config
 from config_layer import validate_paths
 
 @dataclass
 class TrainConfig:
-    """Container for the training hyperparameters."""
+    """Container for training hyperparameters.
+
+    Tunables:
+        epochs: Integer in [1, 500]. Increasing epochs usually improves
+            fit and recall until overfitting starts. Decreasing epochs
+            shortens runtime and lowers overfitting risk, but can leave
+            the model underfit.
+        batch_size: Integer in [1, 256], bounded by GPU/CPU memory.
+            Increasing batch size improves throughput and gradient
+            smoothness, but raises memory use and can reduce
+            generalization. Decreasing it lowers memory pressure and can
+            improve generalization, but increases gradient noise and
+            training time.
+        learning_rate: Float in [1e-6, 1e-1] for Adam in this project.
+            Increasing it speeds early progress, but raises divergence
+            and unstable loss risk. Decreasing it improves stability and
+            final convergence quality, but requires more iterations.
+        seed: Non-negative integer, commonly [0, 2**31-1]. Changing the
+            seed explores stochastic variation. Holding it fixed improves
+            reproducibility for comparisons.
+    """
 
     data_root: pathlib.Path
     model_type: str
@@ -29,6 +55,8 @@ class TrainConfig:
     batch_size: int
     learning_rate: float
     seed: int
+    model_dir: pathlib.Path
+    pretrained_checkpoint: pathlib.Path | None
 
 
 class RadarDataset(Dataset):
@@ -40,57 +68,50 @@ class RadarDataset(Dataset):
             signal = sample_dir / "signal.npy"
             mask = sample_dir / "mask.npy"
             if signal.exists() and mask.exists():
+                validate_extension(signal, [".npy"], "signal sample")
+                validate_extension(mask, [".npy"], "mask sample")
                 self.samples.append((signal, mask))
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(
-        self,
-        index: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
         signal_path, mask_path = self.samples[index]
         signal = np.load(signal_path)
         mask = np.load(mask_path)
         signal_tensor = torch.from_numpy(signal).float()
         mask_tensor = torch.from_numpy(mask).float()
         # Scaling improves stability; altering factor affects gradients.
-        signal_tensor = (signal_tensor - signal_tensor.mean())
+        signal_tensor = signal_tensor - signal_tensor.mean()
         signal_tensor = signal_tensor.unsqueeze(0)
         mask_tensor = mask_tensor.unsqueeze(0)
         return signal_tensor, mask_tensor
 
 
 class SimpleUNet(L.LightningModule):
-    """Minimal UNet-style network for segmentation."""
+    """Minimal UNet-style network for segmentation.
+
+    Tunable architecture value:
+        channels: Integer in [4, 128] depending on available memory.
+            Increasing channels raises representational capacity and can
+            improve fine-detail recall, but increases runtime, memory,
+            and overfitting risk. Decreasing channels makes training and
+            inference faster and lighter, but may reduce segmentation
+            precision on complex patterns.
+    """
 
     def __init__(self, learning_rate: float) -> None:
         super().__init__()
         self.learning_rate = learning_rate
-        channels = 8  # More channels boost accuracy yet add compute.
+        channels = 8
         self.encoder = torch.nn.Sequential(
-            torch.nn.Conv2d(
-                1,
-                channels,
-                kernel_size=3,
-                padding=1,
-            ),
+            torch.nn.Conv2d(1, channels, kernel_size=3, padding=1),
             torch.nn.ReLU(),
-            torch.nn.Conv2d(
-                channels,
-                channels,
-                kernel_size=3,
-                padding=1,
-            ),
+            torch.nn.Conv2d(channels, channels, kernel_size=3, padding=1),
             torch.nn.ReLU(),
         )
         self.decoder = torch.nn.Sequential(
-            torch.nn.Conv2d(
-                channels,
-                channels,
-                kernel_size=3,
-                padding=1,
-            ),
+            torch.nn.Conv2d(channels, channels, kernel_size=3, padding=1),
             torch.nn.ReLU(),
             torch.nn.Conv2d(channels, 1, kernel_size=1),
         )
@@ -108,35 +129,29 @@ class SimpleUNet(L.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
-            self.parameters(),
-            lr=self.learning_rate,
-        )
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
         return optimizer
 
 
 class SimpleClassifier(L.LightningModule):
-    """Lightweight classifier using global pooling."""
+    """Lightweight classifier using global pooling.
+
+    Tunable architecture value:
+        hidden: Integer in [8, 256] depending on memory budget.
+            Increasing hidden width can improve class separation and
+            recall, but increases memory use, latency, and overfitting
+            risk. Decreasing hidden width improves speed and memory
+            usage, but can reduce precision/recall on subtle targets.
+    """
 
     def __init__(self, learning_rate: float) -> None:
         super().__init__()
         self.learning_rate = learning_rate
-        hidden = 32  # Larger hidden dims lift accuracy yet slow epochs.
+        hidden = 32
         self.net = torch.nn.Sequential(
-            torch.nn.Conv2d(
-                1,
-                hidden,
-                kernel_size=5,
-                stride=2,
-                padding=2,
-            ),
+            torch.nn.Conv2d(1, hidden, kernel_size=5, stride=2, padding=2),
             torch.nn.ReLU(),
-            torch.nn.Conv2d(
-                hidden,
-                hidden,
-                kernel_size=3,
-                padding=1,
-            ),
+            torch.nn.Conv2d(hidden, hidden, kernel_size=3, padding=1),
             torch.nn.ReLU(),
         )
         self.head = torch.nn.Linear(hidden, 2)
@@ -157,17 +172,24 @@ class SimpleClassifier(L.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
-            self.parameters(),
-            lr=self.learning_rate,
-        )
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
         return optimizer
 
 
 def make_trainer(config: TrainConfig) -> L.Trainer:
-    """Configure the Lightning trainer."""
+    """Configure the Lightning trainer.
+
+    The trainer precision is selected from accelerator availability:
+    mixed precision on GPU and full precision on CPU.
+
+    Tuning guidance:
+        precision (implicit): values are effectively {16-mixed, 32}.
+            Using mixed precision increases throughput and lowers memory
+            use on supported GPUs, with a small chance of numerical
+            instability for some workloads. Using full precision is
+            slower and heavier, but is generally more numerically stable.
+    """
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
-    # Mixed precision speeds GPU runs yet may affect CPU stability.
     precision = "16-mixed" if accelerator == "gpu" else 32
     trainer = L.Trainer(
         max_epochs=config.epochs,
@@ -186,7 +208,36 @@ def load_model(config: TrainConfig) -> L.LightningModule:
     if config.model_type == "classification":
         return SimpleClassifier(learning_rate=config.learning_rate)
     message = f"Unknown model_type: {config.model_type}"
-    raise ValueError(message)
+    raise TrainScriptError(message)
+
+
+def resolve_checkpoint_path(
+    model_dir: pathlib.Path,
+    model_type: str,
+    checkpoint_arg: pathlib.Path,
+) -> pathlib.Path:
+    """Resolve a checkpoint path from an argument and model directory."""
+    if checkpoint_arg.is_absolute():
+        resolved = checkpoint_arg.resolve()
+    else:
+        resolved = (model_dir / checkpoint_arg).resolve()
+    if resolved.exists():
+        return resolved
+    default_candidates = [
+        model_dir / model_type / "last.ckpt",
+        model_dir / model_type / "best.ckpt",
+    ]
+    candidate_list = "\n".join(
+        f"  - {candidate.resolve()}" for candidate in default_candidates
+    )
+    message = (
+        f"Checkpoint not found: {resolved}\n"
+        "Expected an existing file path. Common filenames/patterns:\n"
+        f"{candidate_list}\n"
+        "You can pass either an absolute path or a path relative "
+        "to --model-dir."
+    )
+    raise FileNotFoundError(message)
 
 
 def seed_everything(seed: int) -> None:
@@ -196,85 +247,71 @@ def seed_everything(seed: int) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments for training."""
-    runtime = load_runtime_config()
-    train_cfg = runtime.raw
+    """Parse CLI arguments for training.
+
+    Tuning guidance for command-line hyperparameters:
+        --epochs: Integer in [1, 500]. Increasing improves convergence
+            potential but lengthens training and can overfit. Decreasing
+            shortens runs and overfitting risk but may underfit.
+        --batch-size: Integer in [1, 256], memory-limited. Increasing
+            raises throughput and memory use while smoothing gradients.
+            Decreasing lowers memory demand but slows throughput and adds
+            gradient noise.
+        --learning-rate: Float in [1e-6, 1e-1]. Increasing speeds early
+            learning but can diverge. Decreasing improves stability and
+            final minima quality but needs more epochs.
+        --seed: Non-negative integer. Adjusting explores run variance;
+            fixing ensures reproducibility.
+    """
     parser = argparse.ArgumentParser(
         description="Run Lightning training with MLflow tracking.",
     )
-    parser.add_argument(
-        "data_root",
-        type=pathlib.Path,
-        nargs="?",
-        default=runtime.paths["processed_data_root"],
-        help=(
-            "Directory holding training samples; fewer samples reduce "
-            "generalization."
-        ),
-    )
-    parser.add_argument(
-        "--model-type",
-        choices=["segmentation", "classification"],
-        default=train_cfg.get("model_type", "segmentation"),
-        help=(
-            "Model family to train; classification ignores pixel "
-            "targets."
-        ),
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=train_cfg.get("epochs", 5),
-        help=(
-            "Number of epochs; more epochs improve convergence yet "
-            "extend runtime."
-        ),
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=train_cfg.get("batch_size", 4),
-        help=(
-            "Batch size; larger batches smooth gradients yet require "
-            "more memory."
-        ),
-    )
-    parser.add_argument(
-        "--learning-rate",
-        type=float,
-        default=train_cfg.get("learning_rate", 1e-3),
-        help=(
-            "Learning rate; higher values speed progress yet risk "
-            "divergence."
-        ),
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=train_cfg.get("seed", 42),
-        help=(
-            "Random seed; modifying it alters weight initialization and "
-            "batch order."
-        ),
-    )
-    parser.add_argument(
-        "--mlflow-run-name",
-        default="gpr-training",
-        help=(
-            "MLflow run name; changing it keeps experiments grouped "
-            "across phases."
-        ),
-    )
-    parser.add_argument(
-        "--tracking-uri",
-        default="file:mlruns",
-        help=(
-            "MLflow tracking URI; pointing to a server centralizes "
-            "records."
-        ),
-    )
-    add_path_override_args(parser, runtime.paths)
+    parser.add_argument("data_root", type=pathlib.Path)
+    parser.add_argument("--model-type", choices=["segmentation", "classification"], default="segmentation")
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--mlflow-run-name", default="gpr-training")
+    parser.add_argument("--tracking-uri", default="file:mlruns")
     return parser.parse_args()
+
+
+def validate_extension(path: pathlib.Path, allowed: List[str], context: str) -> None:
+    if path.suffix.lower() not in allowed:
+        raise TrainScriptError(
+            f"Invalid file extension for {context}: '{path}'. Expected one of {allowed}."
+        )
+
+
+def validate_config(config: TrainConfig) -> None:
+    if not config.data_root.exists() or not config.data_root.is_dir():
+        raise TrainScriptError(
+            f"Training data_root '{config.data_root}' must exist and be a directory."
+        )
+    if config.epochs <= 0:
+        raise TrainScriptError("Invalid --epochs value. Use an integer greater than 0.")
+    if config.batch_size <= 0:
+        raise TrainScriptError("Invalid --batch-size value. Use an integer greater than 0.")
+    if config.learning_rate <= 0:
+        raise TrainScriptError("Invalid --learning-rate value. Use a float greater than 0.")
+
+
+def config_hash(config: TrainConfig) -> str:
+    payload = asdict(config)
+    payload["data_root"] = str(payload["data_root"])
+    encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def write_run_metadata(config: TrainConfig, outputs: Dict[str, Any], path: pathlib.Path) -> None:
+    metadata = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "inputs": {"data_root": str(config.data_root)},
+        "config_hash": config_hash(config),
+        "outputs": outputs,
+    }
+    path.write_text(json.dumps(metadata, indent=2))
 
 
 def build_config(args: argparse.Namespace) -> TrainConfig:
@@ -286,11 +323,20 @@ def build_config(args: argparse.Namespace) -> TrainConfig:
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         seed=args.seed,
+        model_dir=args.model_dir.resolve(),
+        pretrained_checkpoint=(
+            resolve_checkpoint_path(
+                model_dir=args.model_dir.resolve(),
+                model_type=args.model_type,
+                checkpoint_arg=args.pretrained_checkpoint,
+            )
+            if args.pretrained_checkpoint is not None
+            else None
+        ),
     )
 
 
-def main() -> None:
-    """Run the training workflow."""
+def run() -> None:
     args = parse_args()
     validate_paths(
         required_existing=[
@@ -304,18 +350,28 @@ def main() -> None:
         create_if_missing=[args.weights_output_dir, args.evaluation_output_dir],
     )
     config = build_config(args)
+    validate_config(config)
     seed_everything(config.seed)
     dataset = RadarDataset(config.data_root)
-    if not dataset:
-        message = f"No samples found in {config.data_root}"
-        raise RuntimeError(message)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=0,
-    )
+    if len(dataset) == 0:
+        raise TrainScriptError(
+            f"No samples found in '{config.data_root}'. Expected scene_*/signal.npy and mask.npy."
+        )
+    dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, num_workers=0)
     model = load_model(config)
+    if config.pretrained_checkpoint is not None:
+        state = torch.load(config.pretrained_checkpoint, map_location="cpu")
+        if isinstance(state, dict) and "state_dict" in state:
+            model.load_state_dict(
+                {
+                    key.replace("net.", "", 1): value
+                    for key, value in state["state_dict"].items()
+                    if not key.startswith("trainer")
+                },
+                strict=False,
+            )
+        else:
+            model.load_state_dict(state, strict=False)
     trainer = make_trainer(config)
     mlflow.set_tracking_uri(args.tracking_uri)
     with mlflow.start_run(run_name=args.mlflow_run_name):
@@ -326,23 +382,38 @@ def main() -> None:
                 "batch_size": config.batch_size,
                 "learning_rate": config.learning_rate,
                 "seed": config.seed,
+                "model_dir": str(config.model_dir),
+                "pretrained_checkpoint": str(config.pretrained_checkpoint),
             }
         )
         trainer.fit(model=model, train_dataloaders=dataloader)
         train_loss = trainer.callback_metrics.get("train_loss", 0.0)
         metrics = {"train_loss": float(train_loss)}
         mlflow.log_metrics(metrics)
-        ckpt_dir = args.weights_output_dir / config.model_type
+        ckpt_dir = config.model_dir / config.model_type
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_path = ckpt_dir / "last.ckpt"
+        ckpt_path = (ckpt_dir / "last.ckpt").resolve()
         trainer.save_checkpoint(str(ckpt_path))
-        summary = {
-            "model_type": config.model_type,
-            "checkpoint": str(ckpt_path),
-            "metrics": metrics,
-        }
+        summary = {"model_type": config.model_type, "checkpoint": str(ckpt_path), "metrics": metrics}
         summary_path = ckpt_dir / "summary.json"
         summary_path.write_text(json.dumps(summary, indent=2))
+        write_run_metadata(
+            config=config,
+            outputs={"checkpoint": str(ckpt_path), "summary": str(summary_path)},
+            path=ckpt_dir / "run_metadata.json",
+        )
+
+
+def main() -> None:
+    """Run the training workflow with structured failures."""
+    try:
+        run()
+    except TrainScriptError as exc:
+        print(f"[train] {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    except Exception as exc:  # pragma: no cover - defensive CLI boundary
+        print(f"[train] Unexpected failure: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":
