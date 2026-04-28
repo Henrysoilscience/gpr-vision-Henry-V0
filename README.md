@@ -34,7 +34,7 @@ gpr-vision/
 ```
 
 ## Setup
-1. Install Anaconda and create an environment:
+1. Create and activate a Python 3.10+ environment:
    ```bash
    conda create -n gpr-vision python=3.10 -y
    conda activate gpr-vision
