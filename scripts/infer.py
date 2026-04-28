@@ -1,220 +1,222 @@
-"""Run inference on GPR samples using trained checkpoints."""
+"""Run model-based inference for radargrams/images and emit JSON artifacts."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import pathlib
-from typing import Iterable, List
+from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
+from PIL import Image
 import torch
+import torch.nn.functional as F
 
 
-class SimpleUNet(torch.nn.Module):
-    """Simplified UNet decoder for binary segmentation."""
+class UNetModel(torch.nn.Module):
+    """Lightweight UNet-like model for segmentation."""
 
-    def __init__(self) -> None:
+    def __init__(self, base_channels: int = 16) -> None:
         super().__init__()
-        channels = 8  # More channels lift accuracy yet slow inference.
-        self.encoder = torch.nn.Sequential(
-            torch.nn.Conv2d(
-                1,
-                channels,
-                kernel_size=3,
-                padding=1,
-            ),
+        self.enc1 = torch.nn.Sequential(
+            torch.nn.Conv2d(1, base_channels, 3, padding=1),
             torch.nn.ReLU(),
-            torch.nn.Conv2d(
-                channels,
-                channels,
-                kernel_size=3,
-                padding=1,
-            ),
+            torch.nn.Conv2d(base_channels, base_channels, 3, padding=1),
             torch.nn.ReLU(),
         )
-        self.decoder = torch.nn.Sequential(
-            torch.nn.Conv2d(
-                channels,
-                channels,
-                kernel_size=3,
-                padding=1,
-            ),
+        self.pool = torch.nn.MaxPool2d(2)
+        self.enc2 = torch.nn.Sequential(
+            torch.nn.Conv2d(base_channels, base_channels * 2, 3, padding=1),
             torch.nn.ReLU(),
-            torch.nn.Conv2d(channels, 1, kernel_size=1),
+            torch.nn.Conv2d(base_channels * 2, base_channels * 2, 3, padding=1),
+            torch.nn.ReLU(),
+        )
+        self.up = torch.nn.ConvTranspose2d(base_channels * 2, base_channels, 2, stride=2)
+        self.dec = torch.nn.Sequential(
+            torch.nn.Conv2d(base_channels * 2, base_channels, 3, padding=1),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(base_channels, 1, 1),
         )
 
-    def forward(self, batch: torch.Tensor) -> torch.Tensor:
-        encoded = self.encoder(batch)
-        decoded = self.decoder(encoded)
-        return decoded
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        skip = self.enc1(x)
+        low = self.enc2(self.pool(skip))
+        upsampled = self.up(low)
+        if upsampled.shape[-2:] != skip.shape[-2:]:
+            upsampled = F.interpolate(upsampled, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        return self.dec(torch.cat([upsampled, skip], dim=1))
 
 
-class SimpleClassifier(torch.nn.Module):
-    """Simplified classifier mirroring training architecture."""
+class YOLOv8LikeSegModel(torch.nn.Module):
+    """Tiny YOLOv8-style dense segmentation/objectness model."""
 
-    def __init__(self) -> None:
+    def __init__(self, channels: int = 32) -> None:
         super().__init__()
-        hidden = 32  # Larger hidden dims lift accuracy yet add cost.
-        self.net = torch.nn.Sequential(
-            torch.nn.Conv2d(
-                1,
-                hidden,
-                kernel_size=5,
-                stride=2,
-                padding=2,
-            ),
-            torch.nn.ReLU(),
-            torch.nn.Conv2d(
-                hidden,
-                hidden,
-                kernel_size=3,
-                padding=1,
-            ),
-            torch.nn.ReLU(),
+        self.backbone = torch.nn.Sequential(
+            torch.nn.Conv2d(1, channels, 3, stride=2, padding=1),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(channels, channels, 3, padding=1),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(channels, channels * 2, 3, stride=2, padding=1),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(channels * 2, channels * 2, 3, padding=1),
+            torch.nn.SiLU(),
         )
-        self.head = torch.nn.Linear(hidden, 2)
+        self.head = torch.nn.Conv2d(channels * 2, 1, 1)
 
-    def forward(self, batch: torch.Tensor) -> torch.Tensor:
-        features = self.net(batch)
-        pooled = features.mean(dim=[2, 3])
-        logits = self.head(pooled)
-        return logits
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        logits = self.head(self.backbone(x))
+        return F.interpolate(logits, size=x.shape[-2:], mode="bilinear", align_corners=False)
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments for inference."""
-    parser = argparse.ArgumentParser(
-        description=(
-            "Generate predictions from trained checkpoints."
-        ),
-    )
-    parser.add_argument(
-        "input_path",
-        type=pathlib.Path,
-        help=(
-            "File or directory holding .npy radargrams; fewer samples "
-            "shorten processing."
-        ),
-    )
-    parser.add_argument(
-        "output_dir",
-        type=pathlib.Path,
-        help=(
-            "Directory to store predictions; limited space prunes "
-            "history."
-        ),
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=pathlib.Path,
-        required=True,
-        help=(
-            "Model checkpoint to load; outdated checkpoints reduce "
-            "accuracy."
-        ),
-    )
-    parser.add_argument(
-        "--model-type",
-        choices=["segmentation", "classification"],
-        default="segmentation",
-        help=(
-            "Model family for inference; classification outputs class "
-            "probabilities."
-        ),
-    )
-    parser.add_argument(
-        "--threshold",
-        type=float,
-        default=0.5,
-        help=(
-            "Probability threshold for segmentation masks; higher "
-            "values reduce false alarms."
-        ),
-    )
+    parser = argparse.ArgumentParser(description="Inference for trained GPR models.")
+    parser.add_argument("inputs", nargs="+", type=pathlib.Path, help="Input files/directories (.npy/.png/.jpg/.jpeg/.tif).")
+    parser.add_argument("output_dir", type=pathlib.Path, help="Directory to store JSON + optional masks/overlays.")
+    parser.add_argument("--checkpoint", type=pathlib.Path, required=True)
+    parser.add_argument("--model", choices=["unet", "yolov8"], default="unet")
+    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--visualization-dir", type=pathlib.Path, default=None, help="Optional directory for overlay PNG outputs.")
     return parser.parse_args()
 
 
-def load_model(args: argparse.Namespace) -> torch.nn.Module:
-    """Instantiate and load model weights."""
-    if args.model_type == "segmentation":
-        model = SimpleUNet()
+def build_model(model_name: str) -> torch.nn.Module:
+    if model_name == "unet":
+        return UNetModel()
+    if model_name == "yolov8":
+        return YOLOv8LikeSegModel()
+    raise ValueError(f"Unsupported model: {model_name}")
+
+
+def load_model(checkpoint_path: pathlib.Path, model_name: str, device: torch.device) -> torch.nn.Module:
+    model = build_model(model_name)
+    payload = torch.load(checkpoint_path, map_location=device)
+    if isinstance(payload, dict) and "state_dict" in payload:
+        state_dict = payload["state_dict"]
     else:
-        model = SimpleClassifier()
-    state = torch.load(args.checkpoint, map_location="cpu")
-    if isinstance(state, dict) and "state_dict" in state:
-        # Lightning checkpoints keep weights under state_dict.
-        model.load_state_dict({k.replace("net.", "", 1): v
-                               for k, v in state["state_dict"].items()
-                               if not k.startswith("trainer")})
-    else:
-        model.load_state_dict(state)
+        state_dict = payload
+    cleaned = {k.replace("model.", "", 1): v for k, v in state_dict.items()}
+    model.load_state_dict(cleaned, strict=False)
+    model.to(device)
     model.eval()
     return model
 
 
-def iter_inputs(path: pathlib.Path) -> Iterable[pathlib.Path]:
-    """Yield input files from path."""
-    if path.is_file():
-        yield path
+def iter_inputs(paths: List[pathlib.Path]) -> Iterable[pathlib.Path]:
+    for path in paths:
+        if path.is_file():
+            yield path
+        elif path.is_dir():
+            for p in sorted(path.glob("**/*")):
+                if p.suffix.lower() in {".npy", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
+                    yield p
+
+
+def load_array(path: pathlib.Path) -> np.ndarray:
+    if path.suffix.lower() == ".npy":
+        array = np.load(path).astype(np.float32)
     else:
-        for candidate in sorted(path.glob("**/*.npy")):
-            yield candidate
+        image = Image.open(path).convert("L")
+        array = np.asarray(image).astype(np.float32)
+    if array.ndim != 2:
+        raise ValueError(f"Expected a single-channel 2D input, got shape {array.shape} for {path}")
+    array = array - array.mean()
+    array = array / (array.std() + 1e-6)
+    return array
 
 
-def load_signal(path: pathlib.Path) -> torch.Tensor:
-    """Load and normalize a radargram."""
-    array = np.load(path)
-    tensor = torch.from_numpy(array).float()
-    tensor = tensor - tensor.mean()  # Centering stabilizes logits.
-    tensor = tensor.unsqueeze(0).unsqueeze(0)
-    return tensor
+def connected_components(mask: np.ndarray) -> List[Dict[str, object]]:
+    h, w = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    detections: List[Dict[str, object]] = []
+
+    for y in range(h):
+        for x in range(w):
+            if mask[y, x] == 0 or visited[y, x]:
+                continue
+            stack = [(y, x)]
+            visited[y, x] = True
+            coords: List[Tuple[int, int]] = []
+            min_y, min_x, max_y, max_x = y, x, y, x
+            while stack:
+                cy, cx = stack.pop()
+                coords.append((cy, cx))
+                min_y = min(min_y, cy)
+                min_x = min(min_x, cx)
+                max_y = max(max_y, cy)
+                max_x = max(max_x, cx)
+                for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                    if 0 <= ny < h and 0 <= nx < w and not visited[ny, nx] and mask[ny, nx] == 1:
+                        visited[ny, nx] = True
+                        stack.append((ny, nx))
+            detections.append(
+                {
+                    "bbox_xyxy": [int(min_x), int(min_y), int(max_x), int(max_y)],
+                    "area": len(coords),
+                }
+            )
+    return detections
 
 
-def save_output(
-    output_dir: pathlib.Path,
-    input_path: pathlib.Path,
-    logits: torch.Tensor,
-    threshold: float,
-    model_type: str,
-) -> pathlib.Path:
-    """Persist inference results."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    relative = input_path.stem
-    result_dir = output_dir / relative
-    result_dir.mkdir(parents=True, exist_ok=True)
-    logits_path = result_dir / "logits.npy"
-    np.save(logits_path, logits.squeeze().numpy())
-    if model_type == "segmentation":
-        mask = (torch.sigmoid(logits) >= threshold).byte()
-        mask_path = result_dir / "mask.npy"
-        np.save(mask_path, mask.squeeze(0).squeeze(0).numpy())
-    else:
-        probs = torch.softmax(logits, dim=1)
-        probs_path = result_dir / "probs.npy"
-        np.save(probs_path, probs.squeeze(0).numpy())
-    return result_dir
+def save_overlay(base: np.ndarray, mask: np.ndarray, output_path: pathlib.Path) -> None:
+    base_norm = base - base.min()
+    denom = base_norm.max() + 1e-6
+    gray = np.uint8((base_norm / denom) * 255)
+    rgb = np.stack([gray, gray, gray], axis=-1)
+    rgb[mask == 1] = np.array([255, 64, 64], dtype=np.uint8)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(rgb).save(output_path)
 
 
 def main() -> None:
-    """Execute inference pipeline."""
     args = parse_args()
-    model = load_model(args)
-    outputs: List[str] = []
-    for input_file in iter_inputs(args.input_path):
-        signal = load_signal(input_file)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = load_model(args.checkpoint, args.model, device)
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    records: List[Dict[str, object]] = []
+    for input_path in iter_inputs(args.inputs):
+        arr = load_array(input_path)
+        inp = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).to(device)
+
         with torch.no_grad():
-            logits = model(signal)
-        result_dir = save_output(
-            output_dir=args.output_dir,
-            input_path=input_file,
-            logits=logits,
-            threshold=args.threshold,
-            model_type=args.model_type,
-        )
-        outputs.append(str(result_dir))
-    summary_path = args.output_dir / "infer_summary.json"
-    summary_path.write_text(json.dumps(outputs, indent=2))
+            logits = model(inp)
+            probs = torch.sigmoid(logits).squeeze(0).squeeze(0).cpu().numpy()
+
+        mask = (probs >= args.threshold).astype(np.uint8)
+        detections = connected_components(mask)
+
+        sample_name = input_path.parent.name if input_path.stem == "signal" and input_path.parent.name.startswith("scene_") else input_path.stem
+        out_dir = args.output_dir / sample_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        np.save(out_dir / "probs.npy", probs)
+        np.save(out_dir / "mask.npy", mask)
+
+        overlay_path = None
+        if args.visualization_dir is not None:
+            overlay_path = args.visualization_dir / f"{sample_name}_overlay.png"
+            save_overlay(arr, mask, overlay_path)
+
+        confidence = float(probs[mask == 1].mean()) if np.any(mask == 1) else float(probs.mean())
+        record = {
+            "input": str(input_path),
+            "output_dir": str(out_dir),
+            "mask_path": str(out_dir / "mask.npy"),
+            "probs_path": str(out_dir / "probs.npy"),
+            "model": args.model,
+            "threshold": args.threshold,
+            "confidence": confidence,
+            "detections": detections,
+            "overlay_path": str(overlay_path) if overlay_path else None,
+        }
+        (out_dir / "result.json").write_text(json.dumps(record, indent=2))
+        records.append(record)
+
+    summary_path = args.output_dir / "infer_results.json"
+    summary_path.write_text(json.dumps(records, indent=2))
+    print(json.dumps({"num_inputs": len(records), "summary_path": str(summary_path)}, indent=2))
 
 
 if __name__ == "__main__":

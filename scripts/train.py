@@ -1,330 +1,310 @@
-"""Train baseline GPR models using Lightning and MLflow."""
+"""Train GPR models with explicit architecture selection and real metrics."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import pathlib
+import random
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import mlflow
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-
-import lightning as L
+from torch.utils.data import DataLoader, Dataset, random_split
 
 
 @dataclass
 class TrainConfig:
-    """Container for the training hyperparameters."""
+    """Container for training configuration."""
 
     data_root: pathlib.Path
-    model_type: str
+    model_name: str
     epochs: int
     batch_size: int
     learning_rate: float
     seed: int
+    val_ratio: float
+    output_dir: pathlib.Path
 
 
 class RadarDataset(Dataset):
-    """Simple dataset reading signal and mask arrays."""
+    """Dataset reading radargram signal/mask arrays from scene folders."""
 
     def __init__(self, data_root: pathlib.Path) -> None:
         self.samples: List[Tuple[pathlib.Path, pathlib.Path]] = []
-        for sample_dir in sorted(data_root.glob("scene_*/")):
-            signal = sample_dir / "signal.npy"
-            mask = sample_dir / "mask.npy"
-            if signal.exists() and mask.exists():
-                self.samples.append((signal, mask))
+        for scene_dir in sorted(data_root.glob("scene_*/")):
+            signal_path = scene_dir / "signal.npy"
+            mask_path = scene_dir / "mask.npy"
+            if signal_path.exists() and mask_path.exists():
+                self.samples.append((signal_path, mask_path))
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(
-        self,
-        index: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
         signal_path, mask_path = self.samples[index]
-        signal = np.load(signal_path)
-        mask = np.load(mask_path)
-        signal_tensor = torch.from_numpy(signal).float()
-        mask_tensor = torch.from_numpy(mask).float()
-        # Scaling improves stability; altering factor affects gradients.
-        signal_tensor = (signal_tensor - signal_tensor.mean())
+        signal = np.load(signal_path).astype(np.float32)
+        mask = np.load(mask_path).astype(np.float32)
+
+        signal_tensor = torch.from_numpy(signal)
+        signal_tensor = signal_tensor - signal_tensor.mean()
+        denom = signal_tensor.std() + 1e-6
+        signal_tensor = signal_tensor / denom
         signal_tensor = signal_tensor.unsqueeze(0)
-        mask_tensor = mask_tensor.unsqueeze(0)
+
+        mask_tensor = torch.from_numpy(mask).unsqueeze(0)
+        mask_tensor = (mask_tensor > 0.5).float()
         return signal_tensor, mask_tensor
 
 
-class SimpleUNet(L.LightningModule):
-    """Minimal UNet-style network for segmentation."""
+class UNetModel(torch.nn.Module):
+    """Lightweight UNet-like model for segmentation."""
 
-    def __init__(self, learning_rate: float) -> None:
+    def __init__(self, base_channels: int = 16) -> None:
         super().__init__()
-        self.learning_rate = learning_rate
-        channels = 8  # More channels boost accuracy yet add compute.
-        self.encoder = torch.nn.Sequential(
-            torch.nn.Conv2d(
-                1,
-                channels,
-                kernel_size=3,
-                padding=1,
-            ),
+        self.enc1 = torch.nn.Sequential(
+            torch.nn.Conv2d(1, base_channels, 3, padding=1),
             torch.nn.ReLU(),
-            torch.nn.Conv2d(
-                channels,
-                channels,
-                kernel_size=3,
-                padding=1,
-            ),
+            torch.nn.Conv2d(base_channels, base_channels, 3, padding=1),
             torch.nn.ReLU(),
         )
-        self.decoder = torch.nn.Sequential(
-            torch.nn.Conv2d(
-                channels,
-                channels,
-                kernel_size=3,
-                padding=1,
-            ),
+        self.pool = torch.nn.MaxPool2d(2)
+        self.enc2 = torch.nn.Sequential(
+            torch.nn.Conv2d(base_channels, base_channels * 2, 3, padding=1),
             torch.nn.ReLU(),
-            torch.nn.Conv2d(channels, 1, kernel_size=1),
+            torch.nn.Conv2d(base_channels * 2, base_channels * 2, 3, padding=1),
+            torch.nn.ReLU(),
+        )
+        self.up = torch.nn.ConvTranspose2d(base_channels * 2, base_channels, 2, stride=2)
+        self.dec = torch.nn.Sequential(
+            torch.nn.Conv2d(base_channels * 2, base_channels, 3, padding=1),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(base_channels, 1, 1),
         )
 
-    def forward(self, batch: torch.Tensor) -> torch.Tensor:
-        encoded = self.encoder(batch)
-        decoded = self.decoder(encoded)
-        return decoded
-
-    def training_step(self, batch, batch_idx):
-        inputs, targets = batch
-        logits = self(inputs)
-        loss = F.binary_cross_entropy_with_logits(logits, targets)
-        self.log("train_loss", loss, prog_bar=True)
-        return loss
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
-            self.parameters(),
-            lr=self.learning_rate,
-        )
-        return optimizer
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        skip = self.enc1(x)
+        low = self.enc2(self.pool(skip))
+        upsampled = self.up(low)
+        if upsampled.shape[-2:] != skip.shape[-2:]:
+            upsampled = F.interpolate(upsampled, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        fused = torch.cat([upsampled, skip], dim=1)
+        return self.dec(fused)
 
 
-class SimpleClassifier(L.LightningModule):
-    """Lightweight classifier using global pooling."""
+class YOLOv8LikeSegModel(torch.nn.Module):
+    """Tiny YOLOv8-style dense head for binary segmentation/objectness."""
 
-    def __init__(self, learning_rate: float) -> None:
+    def __init__(self, channels: int = 32) -> None:
         super().__init__()
-        self.learning_rate = learning_rate
-        hidden = 32  # Larger hidden dims lift accuracy yet slow epochs.
-        self.net = torch.nn.Sequential(
-            torch.nn.Conv2d(
-                1,
-                hidden,
-                kernel_size=5,
-                stride=2,
-                padding=2,
-            ),
-            torch.nn.ReLU(),
-            torch.nn.Conv2d(
-                hidden,
-                hidden,
-                kernel_size=3,
-                padding=1,
-            ),
-            torch.nn.ReLU(),
+        self.backbone = torch.nn.Sequential(
+            torch.nn.Conv2d(1, channels, 3, stride=2, padding=1),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(channels, channels, 3, padding=1),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(channels, channels * 2, 3, stride=2, padding=1),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(channels * 2, channels * 2, 3, padding=1),
+            torch.nn.SiLU(),
         )
-        self.head = torch.nn.Linear(hidden, 2)
+        self.head = torch.nn.Conv2d(channels * 2, 1, 1)
 
-    def forward(self, batch: torch.Tensor) -> torch.Tensor:
-        features = self.net(batch)
-        pooled = features.mean(dim=[2, 3])
-        logits = self.head(pooled)
-        return logits
-
-    def training_step(self, batch, batch_idx):
-        inputs, targets = batch
-        logits = self(inputs)
-        mean_activation = targets.mean(dim=[1, 2, 3])
-        labels = (mean_activation > 0.0).long()
-        loss = F.cross_entropy(logits, labels)
-        self.log("train_loss", loss, prog_bar=True)
-        return loss
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
-            self.parameters(),
-            lr=self.learning_rate,
-        )
-        return optimizer
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        features = self.backbone(x)
+        logits_lowres = self.head(features)
+        return F.interpolate(logits_lowres, size=x.shape[-2:], mode="bilinear", align_corners=False)
 
 
-def make_trainer(config: TrainConfig) -> L.Trainer:
-    """Configure the Lightning trainer."""
-    accelerator = "gpu" if torch.cuda.is_available() else "cpu"
-    # Mixed precision speeds GPU runs yet may affect CPU stability.
-    precision = "16-mixed" if accelerator == "gpu" else 32
-    trainer = L.Trainer(
-        max_epochs=config.epochs,
-        accelerator=accelerator,
-        precision=precision,
-        enable_checkpointing=True,
-        log_every_n_steps=1,
-    )
-    return trainer
+def build_model(model_name: str) -> torch.nn.Module:
+    """Create model from CLI selection."""
+    if model_name == "unet":
+        return UNetModel()
+    if model_name == "yolov8":
+        return YOLOv8LikeSegModel()
+    raise ValueError(f"Unsupported model: {model_name}")
 
 
-def load_model(config: TrainConfig) -> L.LightningModule:
-    """Build the requested Lightning module."""
-    if config.model_type == "segmentation":
-        return SimpleUNet(learning_rate=config.learning_rate)
-    if config.model_type == "classification":
-        return SimpleClassifier(learning_rate=config.learning_rate)
-    message = f"Unknown model_type: {config.model_type}"
-    raise ValueError(message)
+def dice_score(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Compute batch Dice score."""
+    probs = torch.sigmoid(logits)
+    preds = (probs >= 0.5).float()
+    intersection = (preds * targets).sum(dim=(1, 2, 3))
+    union = preds.sum(dim=(1, 2, 3)) + targets.sum(dim=(1, 2, 3))
+    return ((2 * intersection + 1e-6) / (union + 1e-6)).mean()
+
+
+def run_epoch(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer | None,
+    device: torch.device,
+) -> Dict[str, float]:
+    """Run one training/validation epoch and return metrics."""
+    is_train = optimizer is not None
+    model.train(mode=is_train)
+
+    loss_values: List[float] = []
+    dice_values: List[float] = []
+
+    for signals, masks in dataloader:
+        signals = signals.to(device)
+        masks = masks.to(device)
+
+        with torch.set_grad_enabled(is_train):
+            logits = model(signals)
+            loss = F.binary_cross_entropy_with_logits(logits, masks)
+            dice = dice_score(logits, masks)
+
+        if is_train:
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+        loss_values.append(float(loss.detach().cpu()))
+        dice_values.append(float(dice.detach().cpu()))
+
+    if not loss_values:
+        return {"loss": 0.0, "dice": 0.0}
+    return {"loss": float(np.mean(loss_values)), "dice": float(np.mean(dice_values))}
 
 
 def seed_everything(seed: int) -> None:
-    """Seed all random generators for reproducibility."""
-    torch.manual_seed(seed)
+    """Set deterministic random seeds."""
+    random.seed(seed)
     np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments for training."""
-    parser = argparse.ArgumentParser(
-        description="Run Lightning training with MLflow tracking.",
-    )
-    parser.add_argument(
-        "data_root",
-        type=pathlib.Path,
-        help=(
-            "Directory holding training samples; fewer samples reduce "
-            "generalization."
-        ),
-    )
-    parser.add_argument(
-        "--model-type",
-        choices=["segmentation", "classification"],
-        default="segmentation",
-        help=(
-            "Model family to train; classification ignores pixel "
-            "targets."
-        ),
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=5,
-        help=(
-            "Number of epochs; more epochs improve convergence yet "
-            "extend runtime."
-        ),
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=4,
-        help=(
-            "Batch size; larger batches smooth gradients yet require "
-            "more memory."
-        ),
-    )
-    parser.add_argument(
-        "--learning-rate",
-        type=float,
-        default=1e-3,
-        help=(
-            "Learning rate; higher values speed progress yet risk "
-            "divergence."
-        ),
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help=(
-            "Random seed; modifying it alters weight initialization and "
-            "batch order."
-        ),
-    )
-    parser.add_argument(
-        "--mlflow-run-name",
-        default="gpr-training",
-        help=(
-            "MLflow run name; changing it keeps experiments grouped "
-            "across phases."
-        ),
-    )
-    parser.add_argument(
-        "--tracking-uri",
-        default="file:mlruns",
-        help=(
-            "MLflow tracking URI; pointing to a server centralizes "
-            "records."
-        ),
-    )
+    """Parse CLI arguments."""
+    parser = argparse.ArgumentParser(description="Train GPR models with real metrics.")
+    parser.add_argument("data_root", type=pathlib.Path, help="Root containing scene_*/signal.npy and mask.npy.")
+    parser.add_argument("--model", choices=["unet", "yolov8"], default="unet", help="Model architecture.")
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--val-ratio", type=float, default=0.2, help="Validation split ratio in [0, 0.9].")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output-dir", type=pathlib.Path, default=pathlib.Path("models"))
+    parser.add_argument("--tracking-uri", default="file:mlruns")
+    parser.add_argument("--mlflow-run-name", default="gpr-training")
     return parser.parse_args()
 
 
 def build_config(args: argparse.Namespace) -> TrainConfig:
-    """Convert parsed arguments into a TrainConfig."""
+    """Build training config object from CLI args."""
     return TrainConfig(
         data_root=args.data_root,
-        model_type=args.model_type,
+        model_name=args.model,
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         seed=args.seed,
+        val_ratio=args.val_ratio,
+        output_dir=args.output_dir,
     )
 
 
 def main() -> None:
-    """Run the training workflow."""
+    """Train model and save best checkpoint plus metrics artifacts."""
     args = parse_args()
     config = build_config(args)
+    if not (0.0 <= config.val_ratio < 0.9):
+        raise ValueError("--val-ratio must be in [0.0, 0.9).")
+
     seed_everything(config.seed)
     dataset = RadarDataset(config.data_root)
-    if not dataset:
-        message = f"No samples found in {config.data_root}"
-        raise RuntimeError(message)
-    dataloader = DataLoader(
+    if len(dataset) < 2:
+        raise RuntimeError("Need at least 2 samples for train/validation split.")
+
+    val_size = max(1, int(len(dataset) * config.val_ratio))
+    train_size = len(dataset) - val_size
+    if train_size <= 0:
+        raise RuntimeError("Validation split is too large for dataset size.")
+
+    train_set, val_set = random_split(
         dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=0,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(config.seed),
     )
-    model = load_model(config)
-    trainer = make_trainer(config)
+
+    train_loader = DataLoader(train_set, batch_size=config.batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_set, batch_size=config.batch_size, shuffle=False, num_workers=0)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = build_model(config.model_name).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+
     mlflow.set_tracking_uri(args.tracking_uri)
+    run_dir = config.output_dir / config.model_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    history: List[Dict[str, float]] = []
+    best_val_loss = float("inf")
+    best_ckpt = run_dir / "best.ckpt"
+    last_ckpt = run_dir / "last.ckpt"
+
     with mlflow.start_run(run_name=args.mlflow_run_name):
         mlflow.log_params(
             {
-                "model_type": config.model_type,
+                "model": config.model_name,
                 "epochs": config.epochs,
                 "batch_size": config.batch_size,
                 "learning_rate": config.learning_rate,
+                "val_ratio": config.val_ratio,
                 "seed": config.seed,
             }
         )
-        trainer.fit(model=model, train_dataloaders=dataloader)
-        train_loss = trainer.callback_metrics.get("train_loss", 0.0)
-        metrics = {"train_loss": float(train_loss)}
-        mlflow.log_metrics(metrics)
-        ckpt_dir = pathlib.Path("models") / config.model_type
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_path = ckpt_dir / "last.ckpt"
-        trainer.save_checkpoint(str(ckpt_path))
-        summary = {
-            "model_type": config.model_type,
-            "checkpoint": str(ckpt_path),
-            "metrics": metrics,
-        }
-        summary_path = ckpt_dir / "summary.json"
-        summary_path.write_text(json.dumps(summary, indent=2))
+
+        for epoch in range(1, config.epochs + 1):
+            train_metrics = run_epoch(model, train_loader, optimizer, device)
+            val_metrics = run_epoch(model, val_loader, None, device)
+            combined = {
+                "epoch": epoch,
+                "train_loss": train_metrics["loss"],
+                "train_dice": train_metrics["dice"],
+                "val_loss": val_metrics["loss"],
+                "val_dice": val_metrics["dice"],
+            }
+            history.append(combined)
+            mlflow.log_metrics(combined, step=epoch)
+            print(json.dumps(combined))
+
+            if val_metrics["loss"] < best_val_loss:
+                best_val_loss = val_metrics["loss"]
+                torch.save(
+                    {
+                        "model_name": config.model_name,
+                        "state_dict": model.state_dict(),
+                        "epoch": epoch,
+                        "val_loss": best_val_loss,
+                    },
+                    best_ckpt,
+                )
+
+        torch.save(
+            {
+                "model_name": config.model_name,
+                "state_dict": model.state_dict(),
+                "epoch": config.epochs,
+                "val_loss": history[-1]["val_loss"] if history else None,
+            },
+            last_ckpt,
+        )
+
+    metrics_path = run_dir / "metrics_history.json"
+    metrics_path.write_text(json.dumps(history, indent=2))
+    summary = {
+        "model": config.model_name,
+        "best_checkpoint": str(best_ckpt),
+        "last_checkpoint": str(last_ckpt),
+        "best_val_loss": best_val_loss,
+        "epochs": config.epochs,
+    }
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":
