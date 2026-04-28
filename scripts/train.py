@@ -19,7 +19,27 @@ import lightning as L
 
 @dataclass
 class TrainConfig:
-    """Container for the training hyperparameters."""
+    """Container for training hyperparameters.
+
+    Tunables:
+        epochs: Integer in [1, 500]. Increasing epochs usually improves
+            fit and recall until overfitting starts. Decreasing epochs
+            shortens runtime and lowers overfitting risk, but can leave
+            the model underfit.
+        batch_size: Integer in [1, 256], bounded by GPU/CPU memory.
+            Increasing batch size improves throughput and gradient
+            smoothness, but raises memory use and can reduce
+            generalization. Decreasing it lowers memory pressure and can
+            improve generalization, but increases gradient noise and
+            training time.
+        learning_rate: Float in [1e-6, 1e-1] for Adam in this project.
+            Increasing it speeds early progress, but raises divergence
+            and unstable loss risk. Decreasing it improves stability and
+            final convergence quality, but requires more iterations.
+        seed: Non-negative integer, commonly [0, 2**31-1]. Changing the
+            seed explores stochastic variation. Holding it fixed improves
+            reproducibility for comparisons.
+    """
 
     data_root: pathlib.Path
     model_type: str
@@ -60,12 +80,21 @@ class RadarDataset(Dataset):
 
 
 class SimpleUNet(L.LightningModule):
-    """Minimal UNet-style network for segmentation."""
+    """Minimal UNet-style network for segmentation.
+
+    Tunable architecture value:
+        channels: Integer in [4, 128] depending on available memory.
+            Increasing channels raises representational capacity and can
+            improve fine-detail recall, but increases runtime, memory,
+            and overfitting risk. Decreasing channels makes training and
+            inference faster and lighter, but may reduce segmentation
+            precision on complex patterns.
+    """
 
     def __init__(self, learning_rate: float) -> None:
         super().__init__()
         self.learning_rate = learning_rate
-        channels = 8  # More channels boost accuracy yet add compute.
+        channels = 8
         self.encoder = torch.nn.Sequential(
             torch.nn.Conv2d(
                 1,
@@ -114,12 +143,20 @@ class SimpleUNet(L.LightningModule):
 
 
 class SimpleClassifier(L.LightningModule):
-    """Lightweight classifier using global pooling."""
+    """Lightweight classifier using global pooling.
+
+    Tunable architecture value:
+        hidden: Integer in [8, 256] depending on memory budget.
+            Increasing hidden width can improve class separation and
+            recall, but increases memory use, latency, and overfitting
+            risk. Decreasing hidden width improves speed and memory
+            usage, but can reduce precision/recall on subtle targets.
+    """
 
     def __init__(self, learning_rate: float) -> None:
         super().__init__()
         self.learning_rate = learning_rate
-        hidden = 32  # Larger hidden dims lift accuracy yet slow epochs.
+        hidden = 32
         self.net = torch.nn.Sequential(
             torch.nn.Conv2d(
                 1,
@@ -163,9 +200,19 @@ class SimpleClassifier(L.LightningModule):
 
 
 def make_trainer(config: TrainConfig) -> L.Trainer:
-    """Configure the Lightning trainer."""
+    """Configure the Lightning trainer.
+
+    The trainer precision is selected from accelerator availability:
+    mixed precision on GPU and full precision on CPU.
+
+    Tuning guidance:
+        precision (implicit): values are effectively {16-mixed, 32}.
+            Using mixed precision increases throughput and lowers memory
+            use on supported GPUs, with a small chance of numerical
+            instability for some workloads. Using full precision is
+            slower and heavier, but is generally more numerically stable.
+    """
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
-    # Mixed precision speeds GPU runs yet may affect CPU stability.
     precision = "16-mixed" if accelerator == "gpu" else 32
     trainer = L.Trainer(
         max_epochs=config.epochs,
@@ -194,7 +241,22 @@ def seed_everything(seed: int) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments for training."""
+    """Parse CLI arguments for training.
+
+    Tuning guidance for command-line hyperparameters:
+        --epochs: Integer in [1, 500]. Increasing improves convergence
+            potential but lengthens training and can overfit. Decreasing
+            shortens runs and overfitting risk but may underfit.
+        --batch-size: Integer in [1, 256], memory-limited. Increasing
+            raises throughput and memory use while smoothing gradients.
+            Decreasing lowers memory demand but slows throughput and adds
+            gradient noise.
+        --learning-rate: Float in [1e-6, 1e-1]. Increasing speeds early
+            learning but can diverge. Decreasing improves stability and
+            final minima quality but needs more epochs.
+        --seed: Non-negative integer. Adjusting explores run variance;
+            fixing ensures reproducibility.
+    """
     parser = argparse.ArgumentParser(
         description="Run Lightning training with MLflow tracking.",
     )

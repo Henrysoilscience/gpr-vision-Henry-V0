@@ -12,11 +12,19 @@ import torch
 
 
 class SimpleUNet(torch.nn.Module):
-    """Simplified UNet decoder for binary segmentation."""
+    """Simplified UNet decoder for binary segmentation.
+
+    Tunable architecture value:
+        channels: Integer in [4, 128], constrained by memory budget.
+            Increasing channels can improve detail recovery, but raises
+            inference latency and memory. Decreasing channels speeds
+            inference and lowers memory use, but may hurt segmentation
+            precision/recall on complex targets.
+    """
 
     def __init__(self) -> None:
         super().__init__()
-        channels = 8  # More channels lift accuracy yet slow inference.
+        channels = 8
         self.encoder = torch.nn.Sequential(
             torch.nn.Conv2d(
                 1,
@@ -51,11 +59,19 @@ class SimpleUNet(torch.nn.Module):
 
 
 class SimpleClassifier(torch.nn.Module):
-    """Simplified classifier mirroring training architecture."""
+    """Simplified classifier mirroring training architecture.
+
+    Tunable architecture value:
+        hidden: Integer in [8, 256], memory-dependent.
+            Increasing hidden width can improve class discrimination, but
+            increases latency, memory, and overfitting risk. Decreasing
+            width improves speed and footprint, but may reduce precision
+            and recall for subtle patterns.
+    """
 
     def __init__(self) -> None:
         super().__init__()
-        hidden = 32  # Larger hidden dims lift accuracy yet add cost.
+        hidden = 32
         self.net = torch.nn.Sequential(
             torch.nn.Conv2d(
                 1,
@@ -83,7 +99,15 @@ class SimpleClassifier(torch.nn.Module):
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments for inference."""
+    """Parse CLI arguments for inference.
+
+    Tuning guidance:
+        --threshold: Float in [0.0, 1.0] for segmentation outputs.
+            Increasing threshold reduces false positives (higher
+            precision) but can lower recall. Decreasing threshold
+            captures more positives (higher recall) but may increase
+            false alarms.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Generate predictions from trained checkpoints."
@@ -143,7 +167,6 @@ def load_model(args: argparse.Namespace) -> torch.nn.Module:
         model = SimpleClassifier()
     state = torch.load(args.checkpoint, map_location="cpu")
     if isinstance(state, dict) and "state_dict" in state:
-        # Lightning checkpoints keep weights under state_dict.
         model.load_state_dict({k.replace("net.", "", 1): v
                                for k, v in state["state_dict"].items()
                                if not k.startswith("trainer")})
@@ -166,7 +189,7 @@ def load_signal(path: pathlib.Path) -> torch.Tensor:
     """Load and normalize a radargram."""
     array = np.load(path)
     tensor = torch.from_numpy(array).float()
-    tensor = tensor - tensor.mean()  # Centering stabilizes logits.
+    tensor = tensor - tensor.mean()
     tensor = tensor.unsqueeze(0).unsqueeze(0)
     return tensor
 

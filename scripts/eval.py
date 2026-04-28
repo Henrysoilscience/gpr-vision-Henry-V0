@@ -11,7 +11,15 @@ import numpy as np
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments for evaluation."""
+    """Parse CLI arguments for evaluation.
+
+    Tuning guidance:
+        --threshold: Float in [0.0, 1.0]. Increasing threshold usually
+            improves precision by reducing false positives, but can lower
+            recall by missing weak positives. Decreasing threshold tends
+            to improve recall, but may reduce precision due to extra
+            false positives.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Compute IoU, precision, and recall statistics."
