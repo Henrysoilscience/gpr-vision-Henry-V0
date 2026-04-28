@@ -1,0 +1,14 @@
+[tool.ruff]
+line-length = 73
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+
+[tool.ruff.lint.pycodestyle]
+max-doc-length = 73
+
+[tool.ruff.format]
+line-ending = "lf"
+quote-style = "double"
+indent-style = "space"
