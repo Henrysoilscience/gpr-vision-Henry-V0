@@ -94,3 +94,14 @@ output directory together with an inference summary JSON.
 - Follow PEP8 with a maximum line length of 73 characters.
 - Track experiments through MLflow and document major changes in `docs/`.
 - Commit reproducible configuration files for every delivered milestone.
+
+## Style Checks (Local + CI)
+Run style checks before opening a pull request:
+
+```bash
+python -m ruff check scripts
+python -m ruff format --check scripts
+```
+
+The CI style job should run these same commands so local and CI
+validation stay aligned for linting and formatting.

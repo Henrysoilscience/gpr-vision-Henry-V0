@@ -53,7 +53,7 @@ class RadarDataset(Dataset):
         signal_tensor = torch.from_numpy(signal).float()
         mask_tensor = torch.from_numpy(mask).float()
         # Scaling improves stability; altering factor affects gradients.
-        signal_tensor = (signal_tensor - signal_tensor.mean())
+        signal_tensor = signal_tensor - signal_tensor.mean()
         signal_tensor = signal_tensor.unsqueeze(0)
         mask_tensor = mask_tensor.unsqueeze(0)
         return signal_tensor, mask_tensor

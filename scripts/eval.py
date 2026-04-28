@@ -13,9 +13,7 @@ import numpy as np
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for evaluation."""
     parser = argparse.ArgumentParser(
-        description=(
-            "Compute IoU, precision, and recall statistics."
-        ),
+        description=("Compute IoU, precision, and recall statistics."),
     )
     parser.add_argument(
         "ground_truth",

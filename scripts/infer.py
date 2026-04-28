@@ -85,9 +85,7 @@ class SimpleClassifier(torch.nn.Module):
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for inference."""
     parser = argparse.ArgumentParser(
-        description=(
-            "Generate predictions from trained checkpoints."
-        ),
+        description=("Generate predictions from trained checkpoints."),
     )
     parser.add_argument(
         "input_path",
@@ -144,9 +142,13 @@ def load_model(args: argparse.Namespace) -> torch.nn.Module:
     state = torch.load(args.checkpoint, map_location="cpu")
     if isinstance(state, dict) and "state_dict" in state:
         # Lightning checkpoints keep weights under state_dict.
-        model.load_state_dict({k.replace("net.", "", 1): v
-                               for k, v in state["state_dict"].items()
-                               if not k.startswith("trainer")})
+        model.load_state_dict(
+            {
+                k.replace("net.", "", 1): v
+                for k, v in state["state_dict"].items()
+                if not k.startswith("trainer")
+            }
+        )
     else:
         model.load_state_dict(state)
     model.eval()

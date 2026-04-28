@@ -99,7 +99,8 @@ def synthesize_scene(
         center_x = rng.integers(0, width)
         center_y = rng.integers(0, height)
         radius = rng.integers(5, 15)
-        # Larger radius increases visibility yet reduces sample diversity.
+        # Larger radius increases visibility.
+        # It also reduces sample diversity.
         y, x = np.ogrid[:height, :width]
         distance = np.sqrt((x - center_x) ** 2 + (y - center_y) ** 2)
         region = distance <= radius
