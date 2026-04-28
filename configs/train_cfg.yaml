@@ -1,0 +1,9 @@
+model_type: segmentation
+epochs: 5
+batch_size: 4
+learning_rate: 0.001
+seed: 42
+augmentations:
+  noise_std: 0.3
+  rotate_degrees: 10
+  contrast_limit: 0.2
