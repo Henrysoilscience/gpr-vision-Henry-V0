@@ -45,49 +45,42 @@ gpr-vision-Henry-V0/
 │  │     └─ mask.npy
 │  └─ splits/              # Optional train/val/test split manifests
 ├─ models/
-│  ├─ segmentation/        # Example: last.ckpt after segmentation training
-│  └─ classification/      # Example: last.ckpt after classification training
-├─ outputs/
-│  ├─ inference/           # Inference artifacts + infer_summary.json
-│  └─ evaluation/          # Evaluation JSON summaries
-├─ scripts/
-└─ configs/
+│  ├─ yolov8_detector/
+│  └─ unet_segmenter/
+├─ configs/
+│  ├─ dataset.yaml
+│  ├─ train_cfg.yaml
+│  └─ eval_cfg.yaml
+├─ docs/
+│  ├─ labels_manual.md
+│  ├─ experiment_log.md
+│  ├─ changelog.md
+│  └─ report_final.pdf
+├─ requirements.txt
+└─ README.md
 ```
 
-### Expected file-level contract by stage
-- **Preprocessing input:** `data/raw/**/*.DZT`
-- **Preprocessing output:** per-file directory in `data/processed/<name>/`
-  with `radargram.npy` and `radargram.png`
-- **Training input:** `data/processed/scene_*/signal.npy` and
-  `data/processed/scene_*/mask.npy`
-- **Inference input:** a single `.npy` file or a directory containing `.npy`
-  files
-- **Evaluation input:**
-  - ground truth: `.../scene_*/mask.npy`
-  - predictions: matching `.../scene_*/mask.npy`
+## Setup
+1. Create and activate a Python 3.10+ environment:
+   ```bash
+   conda create -n gpr-vision python=3.10 -y
+   conda activate gpr-vision
+   ```
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-## 3) Data preparation command examples
+## Data Preparation
+1. Place `.DZT` files under `data/raw`.
+2. Run preprocessing:
+   ```bash
+   python scripts/prep_readgssi.py data/raw data/processed \
+       --normalize --manifest docs/prep_manifest.json
+   ```
+3. Review generated manifests and PNG previews for quality control.
 
-### A. Convert raw `.DZT` into normalized arrays + previews
-```bash
-python scripts/prep_readgssi.py \
-  data/raw \
-  data/processed \
-  --normalize \
-  --gain 1.2 \
-  --manifest outputs/prep_manifest.json
-```
-
-### B. No normalization, stronger gain for weak returns
-```bash
-python scripts/prep_readgssi.py \
-  data/raw \
-  data/processed \
-  --gain 2.0 \
-  --manifest outputs/prep_manifest_gain2.json
-```
-
-### C. Generate synthetic scenes from processed assets
+## Synthetic Data Generation
 ```bash
 python scripts/synth_gprmax.py data/processed --count 20 --seed 7
 ```
