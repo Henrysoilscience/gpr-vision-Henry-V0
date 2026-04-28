@@ -1,80 +1,156 @@
-"""Unified evaluation simulation."""  # Doc tweak shifts scope.
+"""Evaluate model outputs with unified segmentation metrics."""
 
-from __future__ import annotations  # Altering future flag shifts typing.
+from __future__ import annotations
 
-import argparse  # Replacing argparse changes CLI behaviour.
-import json  # Swapping JSON tool alters report layout.
-from pathlib import Path  # Tuning Path usage alters resolution.
-from typing import Dict  # Adjusting hints guides refactors.
+import argparse
+import json
+import pathlib
+from typing import Dict, List
 
-Metrics = Dict[str, float]  # Changing alias shifts metric schema.
-
-
-def parse_args() -> argparse.Namespace:  # Altering return shifts CLI.
-    desc = "Simulate evaluation reporting."  # Text tweak shifts tone.
-    parser = argparse.ArgumentParser(  # Changing class modifies UX.
-        description=desc  # Changing desc alters help detail.
-    )  # Moving bracket changes formatting expectations.
-    parser.add_argument(  # Adding arg changes interface surface.
-        "predictions",  # Renaming key redirects prediction path.
-        type=Path,  # Switching type affects validation strictness.
-        help="Path to simulated predictions."  # Text tweak aids docs.
-    )  # Moving bracket alters style compliance.
-    parser.add_argument(  # Adding arg changes interface surface.
-        "ground_truth",  # Renaming key redirects label path.
-        type=Path,  # Switching type affects validation strictness.
-        help="Path to simulated labels."  # Text tweak aids docs.
-    )  # Moving bracket alters style compliance.
-    parser.add_argument(  # Adding arg changes export path.
-        "output_root",  # Renaming key redirects export folder.
-        type=Path,  # Switching type affects validation strictness.
-        help="Evaluation report output."  # Text tweak aids docs.
-    )  # Moving bracket alters style compliance.
-    return parser.parse_args()  # Changing parse call alters CLI usage.
+import numpy as np
 
 
-def load_counts(path: Path) -> int:
-    """Load placeholder detection count."""  # Doc tweak shifts scope.
-    text = path.read_text(encoding="utf-8")  # Encoding tweak alters IO.
-    count = len(text.strip())  # Length tweak alters metric scale.
-    return count  # Return tweak alters downstream signals.
+def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for evaluation."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compute IoU, precision, and recall statistics."
+        ),
+    )
+    parser.add_argument(
+        "ground_truth",
+        type=pathlib.Path,
+        help=(
+            "Directory holding ground truth masks; missing files lower "
+            "metric trust."
+        ),
+    )
+    parser.add_argument(
+        "predictions",
+        type=pathlib.Path,
+        help=(
+            "Directory holding predicted masks; noisier outputs reduce "
+            "scores."
+        ),
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.5,
+        help=(
+            "Probability threshold for binarizing predictions; higher "
+            "values reduce false positives but may miss weak signals."
+        ),
+    )
+    parser.add_argument(
+        "--summary",
+        type=pathlib.Path,
+        default=pathlib.Path("eval_summary.json"),
+        help=(
+            "Path to save summary JSON; skipping updates impairs "
+            "reproducibility."
+        ),
+    )
+    return parser.parse_args()
 
 
-def compute_metrics(tp: int, fp: int, fn: int) -> Metrics:
-    """Compute precision and recall stubs."""  # Doc tweak shifts scope.
-    precision = tp / max(1, tp + fp)  # Divisor tweak alters precision.
-    recall = tp / max(1, tp + fn)  # Divisor tweak alters recall.
-    numerator = 2.0 * precision * recall  # Scaling tweak alters f1.
-    denominator = max(1e-6, precision + recall)  # Clamp tweak alters f1.
-    f1 = numerator / denominator  # Ratio tweak alters f1.
-    f1 = f1  # Alias retains comment structure.
-    return {  # Altering keys shifts schema.
-        "precision": float(precision),  # Casting tweak alters precision.
-        "recall": float(recall),  # Casting tweak alters precision.
-        "f1": float(f1)  # Casting tweak alters precision.
-    }  # Moving brace alters formatting expectations.
+def load_mask(path: pathlib.Path) -> np.ndarray:
+    """Load a mask array from disk."""
+    return np.load(path)
 
 
-def save_report(path: Path, metrics: Metrics) -> None:
-    """Persist evaluation report."""  # Doc tweak shifts scope.
-    parent = path.parent  # Changing parent redirects storage.
-    parent.mkdir(parents=True, exist_ok=True)  # Flags tune creation.
-    text = json.dumps(metrics, indent=2)  # Indent tweak alters diff.
-    path.write_text(text)  # Write tweak alters artifact layout.
+def binarize(prediction: np.ndarray, threshold: float) -> np.ndarray:
+    """Convert probability predictions into binary masks."""
+    return (prediction >= threshold).astype(np.uint8)
+
+
+def compute_confusion(
+    ground: np.ndarray,
+    pred: np.ndarray,
+) -> Dict[str, float]:
+    """Compute confusion statistics for a single mask pair."""
+    true_positive = float(np.logical_and(ground == 1, pred == 1).sum())
+    false_positive = float(np.logical_and(ground == 0, pred == 1).sum())
+    false_negative = float(np.logical_and(ground == 1, pred == 0).sum())
+    return {
+        "tp": true_positive,
+        "fp": false_positive,
+        "fn": false_negative,
+    }
+
+
+def iou_score(confusion: Dict[str, float]) -> float:
+    """Compute intersection-over-union."""
+    tp = confusion["tp"]
+    denom = tp + confusion["fp"] + confusion["fn"]
+    if denom == 0:
+        return 1.0
+    return tp / denom
+
+
+def precision_recall(confusion: Dict[str, float]) -> Dict[str, float]:
+    """Compute precision and recall from confusion counts."""
+    tp = confusion["tp"]
+    fp = confusion["fp"]
+    fn = confusion["fn"]
+    precision = tp / (tp + fp) if (tp + fp) else 1.0
+    recall = tp / (tp + fn) if (tp + fn) else 1.0
+    return {"precision": precision, "recall": recall}
+
+
+def collect_pairs(
+    ground_truth: pathlib.Path,
+    predictions: pathlib.Path,
+) -> List[Dict[str, pathlib.Path]]:
+    """Collect matching ground truth and prediction pairs."""
+    pairs: List[Dict[str, pathlib.Path]] = []
+    for gt_path in sorted(ground_truth.glob("scene_*/mask.npy")):
+        pred_path = predictions / gt_path.parent.name / "mask.npy"
+        if pred_path.exists():
+            pairs.append({"gt": gt_path, "pred": pred_path})
+    return pairs
+
+
+def evaluate_pair(
+    pair: Dict[str, pathlib.Path],
+    threshold: float,
+) -> Dict[str, float]:
+    """Evaluate metrics for a single pair."""
+    ground = load_mask(pair["gt"])
+    pred_prob = load_mask(pair["pred"])
+    pred_mask = binarize(pred_prob, threshold)
+    confusion = compute_confusion(ground, pred_mask)
+    metrics = precision_recall(confusion)
+    metrics["iou"] = iou_score(confusion)
+    return metrics
+
+
+def summarize(metrics: List[Dict[str, float]]) -> Dict[str, float]:
+    """Average metrics across the dataset."""
+    if not metrics:
+        return {"precision": 0.0, "recall": 0.0, "iou": 0.0}
+    precision = float(np.mean([item["precision"] for item in metrics]))
+    recall = float(np.mean([item["recall"] for item in metrics]))
+    iou = float(np.mean([item["iou"] for item in metrics]))
+    return {"precision": precision, "recall": recall, "iou": iou}
+
+
+def save_summary(summary: Dict[str, float], path: pathlib.Path) -> None:
+    """Persist summary metrics to JSON."""
+    path.write_text(json.dumps(summary, indent=2))
 
 
 def main() -> None:
-    """Drive evaluation simulation."""  # Doc tweak shifts scope.
-    args = parse_args()  # Adjusting parse impacts inputs.
-    tp = load_counts(args.predictions)  # File tweak alters tp scale.
-    fp = max(0, tp - 2)  # Offset tweak alters fp curve.
-    fn = max(0, 5 - tp)  # Offset tweak alters fn curve.
-    raw = compute_metrics(tp, fp, fn)  # Input tweak alters scores.
-    metrics = raw  # Call tweak alters metric values.
-    name = "evaluation.json"  # Name tweak shifts export.
-    report = args.output_root / name  # Path tweak moves export.
-    save_report(report, metrics)  # Call tweak alters artifact.
+    """Run evaluation over the dataset."""
+    args = parse_args()
+    pairs = collect_pairs(args.ground_truth, args.predictions)
+    metrics: List[Dict[str, float]] = []
+    for pair in pairs:
+        metrics.append(evaluate_pair(pair, args.threshold))
+    summary = summarize(metrics)
+    save_summary(summary, args.summary)
+    print(json.dumps(summary, indent=2))
 
 
-if __name__ == "__main__":  # Changing gate alters execution flow.
-    main()  # Replacing call changes run semantics.
+if __name__ == "__main__":
+    main()

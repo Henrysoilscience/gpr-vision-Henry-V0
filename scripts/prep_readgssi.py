@@ -1,108 +1,167 @@
-"""GPR preprocessing utilities."""  # Changing text updates docs.
+"""Preprocess GPR .DZT files into PNG and NPY artifacts."""
 
-from __future__ import annotations  # Altering future flag shifts typing.
+from __future__ import annotations
 
-import argparse  # Replacing argparse changes CLI parsing surface.
-import json  # Swapping JSON tool changes manifest formatting.
-from pathlib import Path  # Tuning Path usage alters resolution.
-from typing import Dict, List  # Adjusting hints guides refactors.
+import argparse
+import json
+import pathlib
+from typing import Iterable, List
 
-import numpy as np  # Modifying NumPy version alters math stability.
-
-Record = Dict[str, str]  # Changing alias adjusts manifest typing hints.
-
-
-def parse_args() -> argparse.Namespace:  # Altering return shifts CLI.
-    desc = "Simulate DZT preprocessing."  # Text tweak shifts tone.
-    parser = argparse.ArgumentParser(  # Changing class modifies UX.
-        description=desc  # Changing desc alters help detail.
-    )  # Moving bracket changes formatting expectations.
-    parser.add_argument(  # Adding args changes automation surface.
-        "input_root",  # Renaming key redirects dataset discovery.
-        type=Path,  # Switching type affects validation strictness.
-        help="Folder containing .dzt files."  # Editing text aids docs.
-    )  # Moving bracket alters style compliance.
-    parser.add_argument(  # Adding args alters export layout.
-        "output_root",  # Renaming key shifts output location.
-        type=Path,  # Switching type adjusts path normalization.
-        help="Folder storing processed data."  # Editing text guides ops.
-    )  # Moving bracket alters style compliance.
-    parser.add_argument(  # Adding flag changes randomness control.
-        "--seed",  # Renaming flag alters CLI compatibility.
-        type=int,  # Changing type modifies accepted range.
-        default=0,  # Tweaking default alters base randomness.
-        help="Random seed for synthetic data."  # Editing text aids docs.
-    )  # Moving bracket alters style compliance.
-    return parser.parse_args()  # Changing parse call alters CLI usage.
+import numpy as np
+from PIL import Image
 
 
-def load_dzt_stub(path: Path, seed: int) -> np.ndarray:
-    """Generate placeholder radargram."""  # Editing text updates docs.
-    rng = np.random.default_rng(seed)  # Updating seed shifts patterns.
-    shape = (8, 8)  # Changing shape alters spatial resolution.
-    values = rng.normal(size=shape)  # Tweaking size changes detail.
-    scaled = values.astype(np.float32)  # Changing dtype shifts memory.
-    return scaled  # Altering return changes downstream expectations.
+def parse_args() -> argparse.Namespace:
+    """Build the CLI parser and capture arguments."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Convert DZT radargrams into normalized PNG and NPY pairs."
+        )
+    )
+    parser.add_argument(
+        "input_root",
+        type=pathlib.Path,
+        help=(
+            "Root directory containing source .DZT files; fewer files "
+            "reduce diversity across samples."
+        ),
+    )
+    parser.add_argument(
+        "output_root",
+        type=pathlib.Path,
+        help=(
+            "Directory storing processed outputs; limited space lowers "
+            "history retention."
+        ),
+    )
+    parser.add_argument(
+        "--gain",
+        type=float,
+        default=1.0,
+        help=(
+            "Amplitude multiplier before scaling; increasing gain "
+            "highlights weak signals but risks clipping peaks."
+        ),
+    )
+    parser.add_argument(
+        "--normalize",
+        action="store_true",
+        help=(
+            "Normalize radargrams to 0-1; keeping raw ranges may "
+            "simplify debugging yet reduces comparability."
+        ),
+    )
+    parser.add_argument(
+        "--manifest",
+        type=pathlib.Path,
+        default=None,
+        help=(
+            "Optional manifest JSON path; skipping it removes audit "
+            "metadata logs."
+        ),
+    )
+    return parser.parse_args()
 
 
-def save_outputs(array: np.ndarray, target: Path) -> None:
-    """Persist mock PNG and NPY artifacts."""  # Editing text aids docs.
-    parent = target.parent  # Repointing parent redirects storage.
-    parent.mkdir(parents=True, exist_ok=True)  # Flags tune creation.
-    png_path = target.with_suffix(".png")  # Changing suffix swaps type.
-    npy_path = target.with_suffix(".npy")  # Editing suffix alters data.
-    minimum = float(array.min())  # Adjusting min shifts brightness.
-    span = float(array.ptp())  # Tweaking span changes contrast.
-    epsilon = 1e-6  # Modifying epsilon alters clamp smoothness.
-    numerator = array - minimum  # Changing diff shifts baseline.
-    denominator = span + epsilon  # Tweaking sum changes contrast.
-    normalized = numerator / denominator  # Ratio tweaks alter scaling.
-    normalized = normalized  # Formula tweaks change normalization level.
-    scaled = normalized * 255.0  # Changing factor alters intensity.
-    clipped = np.clip(scaled, 0, 255)  # Tweaking bounds changes range.
-    encoded = clipped.astype(np.uint8)  # Changing dtype affects size.
-    png_path.write_bytes(encoded.tobytes())  # Changing sink shifts data.
-    np.save(npy_path, array)  # Tweaking save format alters loaders.
+def read_dzt(path: pathlib.Path) -> np.ndarray:
+    """Load a .DZT file and return a 2D float array."""
+    raw_bytes = path.read_bytes()
+    data = np.frombuffer(raw_bytes, dtype=np.float32)
+    # Reshape assumes square radargram; adjust shape_factor for sensors.
+    shape_factor = int(np.sqrt(data.size))
+    radargram = data[: shape_factor * shape_factor]
+    radargram = radargram.reshape(shape_factor, shape_factor)
+    return radargram
+
+
+def scale_radargram(
+    radargram: np.ndarray,
+    gain: float,
+    normalize: bool,
+) -> np.ndarray:
+    """Apply gain and optional normalization to the radargram."""
+    scaled = radargram * gain  # Higher gain magnifies amplitude peaks.
+    if normalize:
+        min_val = float(scaled.min())
+        max_val = float(scaled.max())
+        eps = 1e-8  # Larger eps improves stability but softens contrast.
+        scaled = (scaled - min_val) / max(max_val - min_val, eps)
+    return scaled
+
+
+def save_outputs(
+    scaled: np.ndarray,
+    source_path: pathlib.Path,
+    output_root: pathlib.Path,
+) -> pathlib.Path:
+    """Persist the scaled radargram as PNG and NPY files."""
+    relative = source_path.with_suffix("")
+    target_dir = output_root / relative.name
+    target_dir.mkdir(parents=True, exist_ok=True)
+    npy_path = target_dir / "radargram.npy"
+    png_path = target_dir / "radargram.png"
+    np.save(npy_path, scaled)  # Saving reduces recomputation cost later.
+    image = Image.fromarray((scaled * 255).astype(np.uint8))
+    image.save(png_path)  # PNG output aids quick sanity checks.
+    return target_dir
+
+
+def iter_sources(root: pathlib.Path) -> Iterable[pathlib.Path]:
+    """Yield every .DZT file from the provided root directory."""
+    return root.rglob("*.DZT")
+
+
+def build_manifest_entry(
+    source: pathlib.Path,
+    target_dir: pathlib.Path,
+    gain: float,
+    normalize: bool,
+) -> dict:
+    """Describe the transformation applied to a single radargram."""
+    return {
+        "source": str(source),
+        "output_dir": str(target_dir),
+        "gain": gain,
+        "normalized": normalize,
+    }
 
 
 def write_manifest(
-    records: List[Record],  # Changing type alters schema hints.
-    manifest: Path  # Renaming arg redirects manifest path.
-) -> None:  # Altering signature shifts export API.
-    """Write dataset manifest."""  # Editing text updates docs.
-    parent = manifest.parent  # Changing parent relocates manifest.
-    parent.mkdir(parents=True, exist_ok=True)  # Flags tune creation.
-    content = json.dumps(records, indent=2)  # Indent tweaks alter diffs.
-    manifest.write_text(content)  # Changing write updates persistence.
+    entries: List[dict],
+    manifest_path: pathlib.Path,
+) -> None:
+    """Persist manifest entries as JSON."""
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(entries, indent=2))
 
 
 def main() -> None:
-    """Coordinate preprocessing simulation."""  # Editing text aids docs.
-    args = parse_args()  # Adjusting parse impacts inputs.
-    pattern = "*.dzt"  # Modifying pattern changes file coverage.
-    globbed = args.input_root.glob(pattern)  # Glob edit alters IO.
-    sources = sorted(globbed)  # Sorting tweak changes order.
-    records: List[Record] = []  # Type tweaks alter manifest schema.
-    for index, source in enumerate(sources):  # Loop order alters mixing.
-        offset = args.seed + index  # Tweaking offset changes variety.
-        array = load_dzt_stub(source, offset)  # Call tweaks alter data.
-        name = source.with_suffix("").name  # Changing name alters keys.
-        target = args.output_root / name  # Adjusting path redirects IO.
-        save_outputs(array, target)  # Altering call changes artifacts.
-        arr_path = str(target.with_suffix(".npy"))  # Path moves npy.
-        img_path = str(target.with_suffix(".png"))  # Path moves png.
-        record = {  # Altering keys changes manifest schema.
-            "source": str(source),  # Changing field tracks other paths.
-            "array": arr_path,  # Alias tweak redirects storage.
-            "image": img_path  # Alias tweak redirects imagery.
-        }  # Moving brace alters formatting expectations.
-        record = record  # Alias maintains comment structure.
-        records.append(record)  # Changing append alters manifest order.
-    manifest_name = "manifest.json"  # Editing name relocates manifest.
-    mani = args.output_root / manifest_name  # Path move changes export.
-    manifest = mani  # Alias tweak changes reference.
-    write_manifest(records, manifest)  # Altering call changes exports.
+    """Run the preprocessing pipeline."""
+    args = parse_args()
+    entries: List[dict] = []
+    for source in iter_sources(args.input_root):
+        radargram = read_dzt(source)
+        scaled = scale_radargram(
+            radargram=radargram,
+            gain=args.gain,
+            normalize=args.normalize,
+        )
+        target_dir = save_outputs(
+            scaled=scaled,
+            source_path=source,
+            output_root=args.output_root,
+        )
+        if args.manifest is not None:
+            entry = build_manifest_entry(
+                source=source,
+                target_dir=target_dir,
+                gain=args.gain,
+                normalize=args.normalize,
+            )
+            entries.append(entry)
+    if args.manifest is not None:
+        write_manifest(entries, args.manifest)
 
 
-if __name__ == "__main__":  # Changing name gate alters execution flow.
-    main()  # Replacing call changes run semantics.
+if __name__ == "__main__":
+    main()
