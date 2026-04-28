@@ -53,6 +53,8 @@ class TrainConfig:
     batch_size: int
     learning_rate: float
     seed: int
+    model_dir: pathlib.Path
+    pretrained_checkpoint: pathlib.Path | None
 
 
 class RadarDataset(Dataset):
@@ -207,6 +209,35 @@ def load_model(config: TrainConfig) -> L.LightningModule:
     raise TrainScriptError(message)
 
 
+def resolve_checkpoint_path(
+    model_dir: pathlib.Path,
+    model_type: str,
+    checkpoint_arg: pathlib.Path,
+) -> pathlib.Path:
+    """Resolve a checkpoint path from an argument and model directory."""
+    if checkpoint_arg.is_absolute():
+        resolved = checkpoint_arg.resolve()
+    else:
+        resolved = (model_dir / checkpoint_arg).resolve()
+    if resolved.exists():
+        return resolved
+    default_candidates = [
+        model_dir / model_type / "last.ckpt",
+        model_dir / model_type / "best.ckpt",
+    ]
+    candidate_list = "\n".join(
+        f"  - {candidate.resolve()}" for candidate in default_candidates
+    )
+    message = (
+        f"Checkpoint not found: {resolved}\n"
+        "Expected an existing file path. Common filenames/patterns:\n"
+        f"{candidate_list}\n"
+        "You can pass either an absolute path or a path relative "
+        "to --model-dir."
+    )
+    raise FileNotFoundError(message)
+
+
 def seed_everything(seed: int) -> None:
     """Seed all random generators for reproducibility."""
     torch.manual_seed(seed)
@@ -290,6 +321,16 @@ def build_config(args: argparse.Namespace) -> TrainConfig:
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         seed=args.seed,
+        model_dir=args.model_dir.resolve(),
+        pretrained_checkpoint=(
+            resolve_checkpoint_path(
+                model_dir=args.model_dir.resolve(),
+                model_type=args.model_type,
+                checkpoint_arg=args.pretrained_checkpoint,
+            )
+            if args.pretrained_checkpoint is not None
+            else None
+        ),
     )
 
 
@@ -305,6 +346,19 @@ def run() -> None:
         )
     dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, num_workers=0)
     model = load_model(config)
+    if config.pretrained_checkpoint is not None:
+        state = torch.load(config.pretrained_checkpoint, map_location="cpu")
+        if isinstance(state, dict) and "state_dict" in state:
+            model.load_state_dict(
+                {
+                    key.replace("net.", "", 1): value
+                    for key, value in state["state_dict"].items()
+                    if not key.startswith("trainer")
+                },
+                strict=False,
+            )
+        else:
+            model.load_state_dict(state, strict=False)
     trainer = make_trainer(config)
     mlflow.set_tracking_uri(args.tracking_uri)
     with mlflow.start_run(run_name=args.mlflow_run_name):
@@ -315,15 +369,17 @@ def run() -> None:
                 "batch_size": config.batch_size,
                 "learning_rate": config.learning_rate,
                 "seed": config.seed,
+                "model_dir": str(config.model_dir),
+                "pretrained_checkpoint": str(config.pretrained_checkpoint),
             }
         )
         trainer.fit(model=model, train_dataloaders=dataloader)
         train_loss = trainer.callback_metrics.get("train_loss", 0.0)
         metrics = {"train_loss": float(train_loss)}
         mlflow.log_metrics(metrics)
-        ckpt_dir = pathlib.Path("models") / config.model_type
+        ckpt_dir = config.model_dir / config.model_type
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_path = ckpt_dir / "last.ckpt"
+        ckpt_path = (ckpt_dir / "last.ckpt").resolve()
         trainer.save_checkpoint(str(ckpt_path))
         summary = {"model_type": config.model_type, "checkpoint": str(ckpt_path), "metrics": metrics}
         summary_path = ckpt_dir / "summary.json"
