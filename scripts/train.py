@@ -1,4 +1,4 @@
-"""Train baseline GPR models using Lightning and MLflow."""
+"""Train GPR models with explicit architecture selection and real metrics."""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ class TrainConfig:
     """
 
     data_root: pathlib.Path
-    model_type: str
+    model_name: str
     epochs: int
     batch_size: int
     learning_rate: float
@@ -60,7 +60,7 @@ class TrainConfig:
 
 
 class RadarDataset(Dataset):
-    """Simple dataset reading signal and mask arrays."""
+    """Dataset reading radargram signal/mask arrays from scene folders."""
 
     def __init__(self, data_root: pathlib.Path) -> None:
         self.samples: List[Tuple[pathlib.Path, pathlib.Path]] = []
@@ -84,7 +84,9 @@ class RadarDataset(Dataset):
         # Scaling improves stability; altering factor affects gradients.
         signal_tensor = signal_tensor - signal_tensor.mean()
         signal_tensor = signal_tensor.unsqueeze(0)
-        mask_tensor = mask_tensor.unsqueeze(0)
+
+        mask_tensor = torch.from_numpy(mask).unsqueeze(0)
+        mask_tensor = (mask_tensor > 0.5).float()
         return signal_tensor, mask_tensor
 
 
@@ -100,7 +102,7 @@ class SimpleUNet(L.LightningModule):
             precision on complex patterns.
     """
 
-    def __init__(self, learning_rate: float) -> None:
+    def __init__(self, base_channels: int = 16) -> None:
         super().__init__()
         self.learning_rate = learning_rate
         channels = 8
@@ -113,7 +115,6 @@ class SimpleUNet(L.LightningModule):
         self.decoder = torch.nn.Sequential(
             torch.nn.Conv2d(channels, channels, kernel_size=3, padding=1),
             torch.nn.ReLU(),
-            torch.nn.Conv2d(channels, 1, kernel_size=1),
         )
 
     def forward(self, batch: torch.Tensor) -> torch.Tensor:
@@ -132,6 +133,14 @@ class SimpleUNet(L.LightningModule):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
         return optimizer
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        skip = self.enc1(x)
+        low = self.enc2(self.pool(skip))
+        upsampled = self.up(low)
+        if upsampled.shape[-2:] != skip.shape[-2:]:
+            upsampled = F.interpolate(upsampled, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        fused = torch.cat([upsampled, skip], dim=1)
+        return self.dec(fused)
 
 class SimpleClassifier(L.LightningModule):
     """Lightweight classifier using global pooling.
@@ -144,7 +153,10 @@ class SimpleClassifier(L.LightningModule):
             usage, but can reduce precision/recall on subtle targets.
     """
 
-    def __init__(self, learning_rate: float) -> None:
+class YOLOv8LikeSegModel(torch.nn.Module):
+    """Tiny YOLOv8-style dense head for binary segmentation/objectness."""
+
+    def __init__(self, channels: int = 32) -> None:
         super().__init__()
         self.learning_rate = learning_rate
         hidden = 32
@@ -241,9 +253,10 @@ def resolve_checkpoint_path(
 
 
 def seed_everything(seed: int) -> None:
-    """Seed all random generators for reproducibility."""
-    torch.manual_seed(seed)
+    """Set deterministic random seeds."""
+    random.seed(seed)
     np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 def parse_args() -> argparse.Namespace:
@@ -315,10 +328,10 @@ def write_run_metadata(config: TrainConfig, outputs: Dict[str, Any], path: pathl
 
 
 def build_config(args: argparse.Namespace) -> TrainConfig:
-    """Convert parsed arguments into a TrainConfig."""
+    """Build training config object from CLI args."""
     return TrainConfig(
         data_root=args.data_root,
-        model_type=args.model_type,
+        model_name=args.model,
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
@@ -374,13 +387,22 @@ def run() -> None:
             model.load_state_dict(state, strict=False)
     trainer = make_trainer(config)
     mlflow.set_tracking_uri(args.tracking_uri)
+    run_dir = config.output_dir / config.model_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    history: List[Dict[str, float]] = []
+    best_val_loss = float("inf")
+    best_ckpt = run_dir / "best.ckpt"
+    last_ckpt = run_dir / "last.ckpt"
+
     with mlflow.start_run(run_name=args.mlflow_run_name):
         mlflow.log_params(
             {
-                "model_type": config.model_type,
+                "model": config.model_name,
                 "epochs": config.epochs,
                 "batch_size": config.batch_size,
                 "learning_rate": config.learning_rate,
+                "val_ratio": config.val_ratio,
                 "seed": config.seed,
                 "model_dir": str(config.model_dir),
                 "pretrained_checkpoint": str(config.pretrained_checkpoint),

@@ -1,4 +1,4 @@
-"""Run inference on GPR samples using trained checkpoints."""
+"""Run model-based inference for radargrams/images and emit JSON artifacts."""
 
 from __future__ import annotations
 
@@ -11,7 +11,9 @@ from datetime import datetime, timezone
 from typing import Iterable, List
 
 import numpy as np
+from PIL import Image
 import torch
+import torch.nn.functional as F
 
 from config_layer import add_path_override_args, load_runtime_config
 from config_layer import validate_paths
@@ -33,7 +35,14 @@ class SimpleUNet(torch.nn.Module):
         self.decoder = torch.nn.Sequential(
             torch.nn.Conv2d(channels, channels, kernel_size=3, padding=1),
             torch.nn.ReLU(),
-            torch.nn.Conv2d(channels, 1, kernel_size=1),
+            torch.nn.Conv2d(base_channels * 2, base_channels * 2, 3, padding=1),
+            torch.nn.ReLU(),
+        )
+        self.up = torch.nn.ConvTranspose2d(base_channels * 2, base_channels, 2, stride=2)
+        self.dec = torch.nn.Sequential(
+            torch.nn.Conv2d(base_channels * 2, base_channels, 3, padding=1),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(base_channels, 1, 1),
         )
 
     def forward(self, batch: torch.Tensor) -> torch.Tensor:
@@ -50,7 +59,7 @@ class SimpleClassifier(torch.nn.Module):
             torch.nn.Conv2d(hidden, hidden, kernel_size=3, padding=1),
             torch.nn.ReLU(),
         )
-        self.head = torch.nn.Linear(hidden, 2)
+        self.head = torch.nn.Conv2d(channels * 2, 1, 1)
 
     def forward(self, batch: torch.Tensor) -> torch.Tensor:
         return self.head(self.net(batch).mean(dim=[2, 3]))
@@ -87,7 +96,10 @@ def load_model(args: argparse.Namespace) -> torch.nn.Module:
     if isinstance(state, dict) and "state_dict" in state:
         model.load_state_dict({k.replace("net.", "", 1): v for k, v in state["state_dict"].items() if not k.startswith("trainer")})
     else:
-        model.load_state_dict(state)
+        state_dict = payload
+    cleaned = {k.replace("model.", "", 1): v for k, v in state_dict.items()}
+    model.load_state_dict(cleaned, strict=False)
+    model.to(device)
     model.eval()
     return model
 
