@@ -3,21 +3,53 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pathlib
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
+import sys
+from datetime import datetime, timezone
+from typing import Dict, List
 
 import numpy as np
 
+from config_layer import add_path_override_args, load_runtime_config
+from config_layer import validate_paths
 
-@dataclass
-class Component:
-    """Connected component represented by bounding box and pixel set."""
+class EvalScriptError(Exception):
+    """Raised when evaluation inputs are invalid."""
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Compute IoU, precision, and recall statistics.")
+    parser.add_argument("ground_truth", type=pathlib.Path)
+    parser.add_argument("predictions", type=pathlib.Path)
+    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--summary", type=pathlib.Path, default=pathlib.Path("eval_summary.json"))
+    return parser.parse_args()
 
     bbox: Tuple[int, int, int, int]
     pixels: set[Tuple[int, int]]
 
+def validate_extension(path: pathlib.Path, allowed: List[str], context: str) -> None:
+    if path.suffix.lower() not in allowed:
+        raise EvalScriptError(
+            f"Invalid file extension for {context}: '{path}'. Expected one of {allowed}."
+        )
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if not args.ground_truth.is_dir():
+        raise EvalScriptError(f"ground_truth directory does not exist: '{args.ground_truth}'.")
+    if not args.predictions.is_dir():
+        raise EvalScriptError(f"predictions directory does not exist: '{args.predictions}'.")
+    if not (0.0 <= args.threshold <= 1.0):
+        raise EvalScriptError("Invalid --threshold value. Use a float in [0, 1].")
+    validate_extension(args.summary, [".json"], "summary output")
+
+
+def load_mask(path: pathlib.Path) -> np.ndarray:
+    validate_extension(path, [".npy"], "mask input")
+    return np.load(path)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate segmentation outputs with object matching.")
@@ -28,6 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary-txt", type=pathlib.Path, default=pathlib.Path("eval_summary.txt"))
     return parser.parse_args()
 
+def binarize(prediction: np.ndarray, threshold: float) -> np.ndarray:
+    return (prediction >= threshold).astype(np.uint8)
 
 def load_mask(path: pathlib.Path) -> np.ndarray:
     return (np.load(path) > 0.5).astype(np.uint8)
@@ -144,24 +178,30 @@ def evaluate_scene(gt_mask: np.ndarray, pred_mask: np.ndarray) -> Dict[str, floa
     ap_75 = average_precision(gt_comp, pred_comp, 0.75)
     map_score = (ap_50 + ap_75) / 2.0
 
-    return {
-        "tp": confusion["tp"],
-        "fp": confusion["fp"],
-        "fn": confusion["fn"],
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "miou": miou,
-        "ap50": ap_50,
-        "ap75": ap_75,
-        "map": map_score,
-        "gt_instances": len(gt_comp),
-        "pred_instances": len(pred_comp),
-    }
+def compute_confusion(ground: np.ndarray, pred: np.ndarray) -> Dict[str, float]:
+    true_positive = float(np.logical_and(ground == 1, pred == 1).sum())
+    false_positive = float(np.logical_and(ground == 0, pred == 1).sum())
+    false_negative = float(np.logical_and(ground == 1, pred == 0).sum())
+    return {"tp": true_positive, "fp": false_positive, "fn": false_negative}
 
 
-def collect_pairs(ground_truth: pathlib.Path, predictions: pathlib.Path) -> List[Tuple[pathlib.Path, pathlib.Path]]:
-    pairs: List[Tuple[pathlib.Path, pathlib.Path]] = []
+def iou_score(confusion: Dict[str, float]) -> float:
+    tp = confusion["tp"]
+    denom = tp + confusion["fp"] + confusion["fn"]
+    return 1.0 if denom == 0 else tp / denom
+
+
+def precision_recall(confusion: Dict[str, float]) -> Dict[str, float]:
+    tp = confusion["tp"]
+    fp = confusion["fp"]
+    fn = confusion["fn"]
+    precision = tp / (tp + fp) if (tp + fp) else 1.0
+    recall = tp / (tp + fn) if (tp + fn) else 1.0
+    return {"precision": precision, "recall": recall}
+
+
+def collect_pairs(ground_truth: pathlib.Path, predictions: pathlib.Path) -> List[Dict[str, pathlib.Path]]:
+    pairs: List[Dict[str, pathlib.Path]] = []
     for gt_path in sorted(ground_truth.glob("scene_*/mask.npy")):
         scene_name = gt_path.parent.name
         pred_scene_dir = predictions / scene_name
@@ -170,57 +210,72 @@ def collect_pairs(ground_truth: pathlib.Path, predictions: pathlib.Path) -> List
     return pairs
 
 
-def summarize(rows: List[Dict[str, float]]) -> Dict[str, float]:
-    if not rows:
-        return {
-            "num_scenes": 0,
-            "precision": 0.0,
-            "recall": 0.0,
-            "f1": 0.0,
-            "miou": 0.0,
-            "map": 0.0,
-        }
-    keys = ["precision", "recall", "f1", "miou", "map", "ap50", "ap75"]
-    out = {key: float(np.mean([row[key] for row in rows])) for key in keys}
-    out["num_scenes"] = len(rows)
-    return out
+def evaluate_pair(pair: Dict[str, pathlib.Path], threshold: float) -> Dict[str, float]:
+    ground = load_mask(pair["gt"])
+    pred_prob = load_mask(pair["pred"])
+    pred_mask = binarize(pred_prob, threshold)
+    confusion = compute_confusion(ground, pred_mask)
+    metrics = precision_recall(confusion)
+    metrics["iou"] = iou_score(confusion)
+    return metrics
+
+
+def summarize(metrics: List[Dict[str, float]]) -> Dict[str, float]:
+    if not metrics:
+        return {"precision": 0.0, "recall": 0.0, "iou": 0.0}
+    return {
+        "precision": float(np.mean([item["precision"] for item in metrics])),
+        "recall": float(np.mean([item["recall"] for item in metrics])),
+        "iou": float(np.mean([item["iou"] for item in metrics])),
+    }
+
+
+def config_hash(args: argparse.Namespace) -> str:
+    payload = {
+        "ground_truth": str(args.ground_truth),
+        "predictions": str(args.predictions),
+        "threshold": args.threshold,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def save_summary(summary: Dict[str, float], path: pathlib.Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(summary, indent=2))
+
+
+def write_run_metadata(args: argparse.Namespace, evaluated_count: int, path: pathlib.Path) -> None:
+    metadata = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "inputs": {"ground_truth": str(args.ground_truth), "predictions": str(args.predictions)},
+        "config_hash": config_hash(args),
+        "evaluated_pairs": evaluated_count,
+    }
+    path.write_text(json.dumps(metadata, indent=2))
+
+
+def run() -> None:
+    args = parse_args()
+    validate_args(args)
+    pairs = collect_pairs(args.ground_truth, args.predictions)
+    if not pairs:
+        raise EvalScriptError("No matching scene_*/mask.npy pairs found between ground_truth and predictions.")
+    metrics = [evaluate_pair(pair, args.threshold) for pair in pairs]
+    summary = summarize(metrics)
+    save_summary(summary, args.summary)
+    write_run_metadata(args, evaluated_count=len(pairs), path=args.summary.parent / "eval_run_metadata.json")
+    print(json.dumps(summary, indent=2))
 
 
 def main() -> None:
-    args = parse_args()
-    pairs = collect_pairs(args.ground_truth, args.predictions)
-    per_scene: List[Dict[str, float | str]] = []
-
-    for gt_path, pred_dir in pairs:
-        gt_mask = load_mask(gt_path)
-        pred_mask = load_pred_mask(pred_dir, args.threshold)
-        metrics = evaluate_scene(gt_mask, pred_mask)
-        metrics["scene"] = gt_path.parent.name
-        per_scene.append(metrics)
-
-    summary = summarize([item for item in per_scene if isinstance(item, dict)])
-    report = {
-        "summary": summary,
-        "per_scene": per_scene,
-        "threshold": args.threshold,
-    }
-
-    args.report_json.parent.mkdir(parents=True, exist_ok=True)
-    args.report_json.write_text(json.dumps(report, indent=2))
-
-    text_lines = [
-        "GPR Evaluation Summary",
-        f"Scenes evaluated: {summary['num_scenes']}",
-        f"mAP: {summary['map']:.4f} (AP50={summary.get('ap50', 0.0):.4f}, AP75={summary.get('ap75', 0.0):.4f})",
-        f"mIoU: {summary['miou']:.4f}",
-        f"Precision: {summary['precision']:.4f}",
-        f"Recall: {summary['recall']:.4f}",
-        f"F1: {summary['f1']:.4f}",
-    ]
-    args.summary_txt.parent.mkdir(parents=True, exist_ok=True)
-    args.summary_txt.write_text("\n".join(text_lines) + "\n")
-
-    print(json.dumps(summary, indent=2))
+    try:
+        run()
+    except EvalScriptError as exc:
+        print(f"[eval] {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    except Exception as exc:  # pragma: no cover
+        print(f"[eval] Unexpected failure: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":
